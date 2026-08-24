@@ -63,3 +63,20 @@ mypy src
 
 During coordinated development with `pyactivesync`, install it from an
 adjacent editable checkout rather than PyPI.
+
+### Live tests
+
+`tests/integration/test_eas_adapter_live.py` exercises `EasAdapter` and
+`AccountRegistry` against a real EAS server. It skips automatically unless
+these environment variables are set (never commit real values):
+
+```bash
+export JMAP_EAS_LIVE_SERVER=...
+export JMAP_EAS_LIVE_USER=...        # e.g. a domain\user login
+export JMAP_EAS_LIVE_SMTP_USER=...   # optional, defaults to JMAP_EAS_LIVE_USER
+export JMAP_EAS_LIVE_DEVICE_ID=...
+export JMAP_EAS_LIVE_PASSWORD=...
+pytest tests/integration/test_eas_adapter_live.py
+```
+
+It only calls read-only commands (`Provision`, `FolderSync`).
