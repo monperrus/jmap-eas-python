@@ -30,7 +30,7 @@ def test_lifespan_closes_registry_and_connection(tmp_path):
     import sqlite3
 
     try:
-        app.state.jmap_eas.connection.execute("SELECT 1")
+        app.state.jmap_eas.database.execute("SELECT 1")
     except sqlite3.ProgrammingError:
         pass
     else:
@@ -77,7 +77,7 @@ def test_main_starts_uvicorn_with_configured_host_and_port(tmp_path, monkeypatch
     def fake_run(app, *, host, port):
         captured["host"] = host
         captured["port"] = port
-        app.state.jmap_eas.connection.close()
+        app.state.jmap_eas.database.close()
 
     monkeypatch.setattr(app_module.uvicorn, "run", fake_run)
     app_module.main()

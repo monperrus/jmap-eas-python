@@ -12,7 +12,7 @@ from typing import Protocol
 
 from pyactivesync import Client
 from pyactivesync.exceptions import EASError
-from pyactivesync.models import Folder
+from pyactivesync.models import BodyType, FetchedItem, Folder, SyncResult
 
 from ..config import AccountConfig
 from ..errors import map_eas_exception
@@ -23,8 +23,15 @@ class EasClientProtocol(Protocol):
 
     def provision(self) -> str: ...
 
-    def list_folders(self) -> list[Folder]:
-        ...
+    def list_folders(self) -> list[Folder]: ...
+
+    def sync_folder(
+        self, folder_id: str, sync_key: str = "0", *, window_size: int = 25, filter_type: str | None = None
+    ) -> SyncResult: ...
+
+    def fetch_item(self, folder_id: str, item_id: str, *, body_type: BodyType = BodyType.HTML) -> FetchedItem: ...
+
+    def fetch_attachment(self, file_reference: str) -> bytes: ...
 
     def close(self) -> None: ...
 
@@ -57,6 +64,24 @@ class EasAdapter:
     def list_folders(self) -> list[Folder]:
         try:
             return self._client.list_folders()
+        except EASError as exc:
+            raise map_eas_exception(exc) from exc
+
+    def sync_folder(self, folder_id: str, sync_key: str = "0", *, window_size: int = 100) -> SyncResult:
+        try:
+            return self._client.sync_folder(folder_id, sync_key, window_size=window_size)
+        except EASError as exc:
+            raise map_eas_exception(exc) from exc
+
+    def fetch_item(self, folder_id: str, item_id: str, *, body_type: BodyType = BodyType.HTML) -> FetchedItem:
+        try:
+            return self._client.fetch_item(folder_id, item_id, body_type=body_type)
+        except EASError as exc:
+            raise map_eas_exception(exc) from exc
+
+    def fetch_attachment(self, file_reference: str) -> bytes:
+        try:
+            return self._client.fetch_attachment(file_reference)
         except EASError as exc:
             raise map_eas_exception(exc) from exc
 

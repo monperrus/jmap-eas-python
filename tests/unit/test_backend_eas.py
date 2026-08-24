@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from pyactivesync.exceptions import StatusError
-from pyactivesync.models import Folder, FolderType
+from pyactivesync.models import BodyType, FetchedItem, Folder, FolderType, ItemBody, SyncItem, SyncResult
 
 import jmap_eas.backend.eas as eas_module
 from jmap_eas.backend.eas import EasAdapter
@@ -26,6 +26,31 @@ class FakeClient:
         if self.fail:
             raise StatusError("FolderSync", "12")
         return [Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")]
+
+    def sync_folder(self, folder_id, sync_key="0", *, window_size=100, filter_type=None):
+        if self.fail:
+            raise StatusError("Sync", "12")
+        return SyncResult(
+            sync_key="1",
+            added=[SyncItem(server_id="9:1", fields={"Email.Subject": "Hello"})],
+            changed=[],
+            deleted=[],
+            more_available=False,
+        )
+
+    def fetch_item(self, folder_id, item_id, *, body_type=BodyType.HTML):
+        if self.fail:
+            raise StatusError("ItemOperations", "12")
+        return FetchedItem(
+            fields={"Email.Subject": "Hello"},
+            bodies=[ItemBody(type=body_type, data="<p>hi</p>")],
+            attachments=[],
+        )
+
+    def fetch_attachment(self, file_reference):
+        if self.fail:
+            raise StatusError("ItemOperations", "12")
+        return b"attachment-bytes"
 
     def close(self) -> None:
         self.closed = True
@@ -57,6 +82,44 @@ def test_list_folders_maps_eas_exception_to_backend_error():
     # The client-visible message must not leak the raw EAS exception text.
     assert "FolderSync" not in str(exc_info.value)
     assert isinstance(exc_info.value.cause, StatusError)
+
+
+def test_sync_folder_returns_result():
+    adapter = EasAdapter(FakeClient())
+    result = adapter.sync_folder("1", "0")
+    assert result.sync_key == "1"
+    assert result.added[0].server_id == "9:1"
+
+
+def test_sync_folder_maps_eas_exception_to_backend_error():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError) as exc_info:
+        adapter.sync_folder("1", "0")
+    assert "Sync" not in str(exc_info.value)
+
+
+def test_fetch_item_returns_fetched_item():
+    adapter = EasAdapter(FakeClient())
+    item = adapter.fetch_item("1", "9:1")
+    assert item.fields["Email.Subject"] == "Hello"
+    assert item.bodies[0].data == "<p>hi</p>"
+
+
+def test_fetch_item_maps_eas_exception_to_backend_error():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.fetch_item("1", "9:1")
+
+
+def test_fetch_attachment_returns_bytes():
+    adapter = EasAdapter(FakeClient())
+    assert adapter.fetch_attachment("ref") == b"attachment-bytes"
+
+
+def test_fetch_attachment_maps_eas_exception_to_backend_error():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.fetch_attachment("ref")
 
 
 def test_close_closes_underlying_client():

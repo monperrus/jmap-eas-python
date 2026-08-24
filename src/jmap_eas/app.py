@@ -16,6 +16,7 @@ from . import __version__
 from .config import AppConfig, load_config
 from .registry import AccountRegistry
 from .store import db as store_db
+from .store.db import Database
 
 CONFIG_ENV_VAR = "JMAP_EAS_CONFIG"
 
@@ -23,16 +24,16 @@ CONFIG_ENV_VAR = "JMAP_EAS_CONFIG"
 class AppState:
     """Resources shared across requests: configuration, EAS registry, and the database."""
 
-    def __init__(self, config: AppConfig, registry: AccountRegistry, connection: sqlite3.Connection) -> None:
+    def __init__(self, config: AppConfig, registry: AccountRegistry, database: Database) -> None:
         self.config = config
         self.registry = registry
-        self.connection = connection
+        self.database = database
 
 
 def _build_state(config: AppConfig) -> AppState:
-    connection = store_db.connect(config.server.db_path)
+    database = store_db.connect(config.server.db_path)
     registry = AccountRegistry(config.accounts)
-    return AppState(config, registry, connection)
+    return AppState(config, registry, database)
 
 
 @asynccontextmanager
@@ -42,14 +43,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         yield
     finally:
         state.registry.close_all()
-        state.connection.close()
+        state.database.close()
 
 
 async def healthz(request: Request) -> JSONResponse:
     """Liveness probe: process up and the local database reachable. No secrets, no EAS calls."""
     state: AppState = request.app.state.jmap_eas
     try:
-        state.connection.execute("SELECT 1")
+        state.database.execute("SELECT 1")
     except sqlite3.Error:
         return JSONResponse({"status": "error", "version": __version__}, status_code=503)
     return JSONResponse({"status": "ok", "version": __version__})
