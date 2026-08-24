@@ -14,13 +14,20 @@ class ConfigError(Exception):
 
 
 class AccountConfig(BaseModel):
-    """One EAS mailbox exposed as a JMAP account."""
+    """One EAS mailbox exposed as a JMAP account.
+
+    `api_token` (or `api_token_env`) is the credential JMAP clients present to
+    *this bridge* over HTTP Basic auth -- distinct from the EAS password, so a
+    bridge secret leak never exposes the mailbox password and vice versa.
+    """
 
     eas_server: str
     username: str
     device_id: str
     password: str | None = None
     password_env: str | None = None
+    api_token: str | None = None
+    api_token_env: str | None = None
     user: str | None = None
     verify_ssl: bool = True
     timeout: float = 30.0
@@ -29,17 +36,27 @@ class AccountConfig(BaseModel):
     def _exactly_one_password_source(self) -> AccountConfig:
         if (self.password is None) == (self.password_env is None):
             raise ValueError("set exactly one of 'password' or 'password_env'")
+        if (self.api_token is None) == (self.api_token_env is None):
+            raise ValueError("set exactly one of 'api_token' or 'api_token_env'")
         return self
 
     def resolve_password(self) -> str:
         """Read the account password, either inline or from the configured environment variable."""
-        if self.password is not None:
-            return self.password
-        assert self.password_env is not None
-        value = os.environ.get(self.password_env)
-        if value is None:
-            raise ConfigError(f"environment variable {self.password_env!r} is not set")
-        return value
+        return self._resolve_secret(self.password, self.password_env)
+
+    def resolve_api_token(self) -> str:
+        """Read the bridge-facing API token, either inline or from the configured environment variable."""
+        return self._resolve_secret(self.api_token, self.api_token_env)
+
+    @staticmethod
+    def _resolve_secret(value: str | None, env_var: str | None) -> str:
+        if value is not None:
+            return value
+        assert env_var is not None
+        resolved = os.environ.get(env_var)
+        if resolved is None:
+            raise ConfigError(f"environment variable {env_var!r} is not set")
+        return resolved
 
 
 class PolicyConfig(BaseModel):

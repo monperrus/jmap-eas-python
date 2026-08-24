@@ -25,6 +25,20 @@ MAILBOX_ROLES: dict[FolderType, str] = {
     FolderType.OUTBOX: "outbox",
 }
 
+# This is a Mail-only bridge (plan.md's goal): Calendar/Contacts/Tasks/Notes/
+# Journal/RecipientCache folders exist in the EAS hierarchy but are never
+# exposed as JMAP Mailboxes or synced -- pyactivesync's `Sync` targets the
+# Email item class and does not reliably decode other classes' items.
+MAIL_FOLDER_TYPES: frozenset[FolderType] = frozenset({
+    FolderType.INBOX, FolderType.DRAFTS, FolderType.DELETED_ITEMS, FolderType.SENT_ITEMS,
+    FolderType.OUTBOX, FolderType.USER_MAIL,
+})
+
+
+def is_mail_folder(folder_type: FolderType) -> bool:
+    return folder_type in MAIL_FOLDER_TYPES
+
+
 _SUBJECT_PREFIX = re.compile(r"^\s*(re|fw|fwd|aw)(\[\d+\])?\s*:\s*", re.IGNORECASE)
 
 

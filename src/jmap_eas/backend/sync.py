@@ -19,10 +19,16 @@ from ..store.db import Database
 from . import mapping
 from .eas import EasAdapter
 
+DEFAULT_MAX_PAGES_PER_CALL = 10
+"""Bounds one `sync_folder()` call's worst-case latency (plan.md's "before a request" contract
+must not mean "block until a multi-year mailbox is fully synced"). A folder with more pending
+pages than this simply finishes over subsequent calls -- its SyncKey is persisted after every page."""
+
 
 class SyncCoordinator:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, max_pages_per_call: int = DEFAULT_MAX_PAGES_PER_CALL) -> None:
         self._database = database
+        self._max_pages_per_call = max_pages_per_call
         self._folder_locks: dict[tuple[str, str], threading.Lock] = {}
         self._folder_locks_guard = threading.Lock()
 
@@ -36,8 +42,13 @@ class SyncCoordinator:
             return lock
 
     def reconcile_folders(self, account_id: str, adapter: EasAdapter) -> None:
-        """Full `FolderSync` listing, diffed against the cache and applied in one transaction."""
-        remote_folders = adapter.list_folders()
+        """Full `FolderSync` listing, diffed against the cache and applied in one transaction.
+
+        Only mail-class folders are cached or synced (`mapping.is_mail_folder`);
+        this is a Mail-only bridge, and `pyactivesync`'s `Sync` targets the
+        Email item class.
+        """
+        remote_folders = [f for f in adapter.list_folders() if mapping.is_mail_folder(f.type)]
         remote_ids = {folder.id for folder in remote_folders}
         with self._database.transaction() as conn:
             local_ids = {mailbox.mailbox_id for mailbox in cache.list_mailboxes(conn, account_id)}
@@ -50,20 +61,26 @@ class SyncCoordinator:
                 state.append_change(conn, account_id, "Mailbox", removed_id, "destroyed")
 
     def sync_folder(self, account_id: str, folder_id: str, adapter: EasAdapter) -> None:
-        """Bring one folder's cached items up to date, paging until `more_available` is false.
+        """Bring one folder's cached items closer to up to date, paging until `more_available`
+        is false or `max_pages_per_call` pages have been applied, whichever comes first.
 
         A stored `SyncKey` of `"0"` means this folder has never been synced:
         the first call only bootstraps a key (plan.md section 4), so at least
-        one further call is always made to fetch its actual items.
+        one further call is always made to fetch its actual items. A folder
+        with more pending pages than the cap simply finishes over later calls.
         """
         with self._folder_lock(account_id, folder_id):
             with self._database.transaction() as conn:
                 mailbox = cache.get_mailbox(conn, account_id, folder_id)
             sync_key = mailbox.sync_key if mailbox is not None else "0"
+            pages_applied = 0
             while True:
                 was_bootstrap = sync_key == "0"
                 sync_key, more_available = self._sync_folder_once(account_id, folder_id, adapter, sync_key)
-                if not was_bootstrap and not more_available:
+                if was_bootstrap:
+                    continue
+                pages_applied += 1
+                if not more_available or pages_applied >= self._max_pages_per_call:
                     break
 
     def sync_account(self, account_id: str, adapter: EasAdapter) -> None:

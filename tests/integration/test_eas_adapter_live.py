@@ -34,6 +34,7 @@ def live_account() -> AccountConfig:
         password=os.environ["JMAP_EAS_LIVE_PASSWORD"],
         device_id=os.environ["JMAP_EAS_LIVE_DEVICE_ID"],
         user=os.environ.get("JMAP_EAS_LIVE_SMTP_USER"),
+        api_token="live-test-token",
     )
 
 

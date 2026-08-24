@@ -23,6 +23,7 @@ def test_load_config_minimal(tmp_path):
         eas_server = "https://mail.example.com/Microsoft-Server-ActiveSync"
         username = "alice@example.com"
         password_env = "ALICE_PASSWORD"
+        api_token_env = "ALICE_TOKEN"
         device_id = "dev1"
         """,
     )
@@ -71,6 +72,7 @@ def test_account_config_resolve_password_inline():
         username="alice@example.com",
         device_id="dev1",
         password="secret",
+        api_token="token",
     )
     assert account.resolve_password() == "secret"
 
@@ -82,8 +84,34 @@ def test_account_config_resolve_password_from_env(monkeypatch):
         username="alice@example.com",
         device_id="dev1",
         password_env="ALICE_PASSWORD",
+        api_token="token",
     )
     assert account.resolve_password() == "secret-from-env"
+
+
+def test_account_config_requires_exactly_one_api_token_source():
+    base = dict(
+        eas_server="https://mail.example.com/Microsoft-Server-ActiveSync",
+        username="alice@example.com",
+        device_id="dev1",
+        password="secret",
+    )
+    with pytest.raises(ValidationError):
+        AccountConfig(**base)
+    with pytest.raises(ValidationError):
+        AccountConfig(**base, api_token="a", api_token_env="B")
+
+
+def test_account_config_resolve_api_token_from_env(monkeypatch):
+    monkeypatch.setenv("ALICE_TOKEN", "token-from-env")
+    account = AccountConfig(
+        eas_server="https://mail.example.com/Microsoft-Server-ActiveSync",
+        username="alice@example.com",
+        device_id="dev1",
+        password="secret",
+        api_token_env="ALICE_TOKEN",
+    )
+    assert account.resolve_api_token() == "token-from-env"
 
 
 def test_account_config_resolve_password_missing_env(monkeypatch):
@@ -93,6 +121,7 @@ def test_account_config_resolve_password_missing_env(monkeypatch):
         username="alice@example.com",
         device_id="dev1",
         password_env="MISSING_PASSWORD",
+        api_token="token",
     )
     with pytest.raises(ConfigError, match="MISSING_PASSWORD"):
         account.resolve_password()

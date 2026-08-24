@@ -30,6 +30,7 @@ def _account(**overrides) -> AccountConfig:
         username="alice@example.com",
         device_id="dev1",
         password="secret",
+        api_token="token",
     )
     defaults.update(overrides)
     return AccountConfig(**defaults)

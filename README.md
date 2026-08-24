@@ -11,10 +11,27 @@ Mail-only bridge; Contacts and Calendar are out of scope for v1.
 
 ## Status
 
-Foundation stage (M0): package layout, configuration, the ASGI application
-lifecycle, SQLite connection/migration plumbing, and a small `pyactivesync`
-adapter with a lazy per-account registry. No JMAP methods are implemented
-yet — that starts with the M1 read path.
+M1, the synchronized read path, is implemented: `GET /.well-known/jmap`
+(session resource), `POST /api` (`Core/echo`, `Mailbox/get`/`query`/`changes`,
+`Email/get`/`query`/`changes`, `Thread/get`), and `GET /download/...` for
+message and attachment blobs. Every request re-syncs the authenticated
+account's folders and messages from EAS into the local cache before serving
+it. `Email/get`'s cheap properties (subject, addresses, receivedAt, keywords,
+mailboxIds, threadId) come straight from that cache; `size`, `preview`,
+`hasAttachment`, `attachments`, `textBody`/`htmlBody`, and `bodyValues` need a
+live `ItemOperations` fetch and are only fetched when actually requested.
+`bcc`, `sender`, `sentAt`, `inReplyTo`, `references`, `messageId`, and
+`bodyStructure` aren't derivable from what `pyactivesync`'s `Sync`/`Fetch`
+expose today and are always returned `null`. Nothing mutates yet — every
+`*/set` method and `EmailSubmission` are M2/M3.
+
+A folder sync caches at most 10 pages (1000 items) per request
+(`SyncCoordinator.DEFAULT_MAX_PAGES_PER_CALL`) so one JMAP request can never
+block for as long as a large mailbox's full initial sync takes; a folder with
+more pending pages just keeps catching up over subsequent requests. Verified
+live against a real Exchange mailbox with 1000+ messages per folder,
+including empty folders (a real-world empty-`Sync`-response-body bug this
+uncovered was fixed upstream in `pyactivesync`).
 
 ## Configuration
 
@@ -36,12 +53,16 @@ allow_send = true
 [accounts.alice]
 eas_server = "https://mail.example.com/Microsoft-Server-ActiveSync"
 username = "alice@example.com"
-password_env = "JMAP_EAS_ALICE_PASSWORD"   # read from the environment, never stored in JMAP responses or logs
+password_env = "JMAP_EAS_ALICE_PASSWORD"   # the EAS mailbox password
+api_token_env = "JMAP_EAS_ALICE_TOKEN"     # a separate bridge-only secret JMAP clients authenticate with
 device_id = "jmapeas0001"
 ```
 
-`pyactivesync` supports HTTP Basic authentication only (including
-`domain\user` login strings); NTLM and OAuth are not available.
+`pyactivesync` supports HTTP Basic authentication to EAS only (including
+`domain\user` login strings); NTLM and OAuth are not available. JMAP clients
+authenticate to *this bridge* separately, over HTTP Basic auth with the
+account id as username and `api_token` as password -- a bridge secret, never
+the EAS mailbox password.
 
 ## Known limitations (v1)
 

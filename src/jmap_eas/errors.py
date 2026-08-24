@@ -6,8 +6,6 @@ for server-side logging only, and exposes a generic message instead.
 """
 from __future__ import annotations
 
-from pyactivesync.exceptions import EASError
-
 
 class JmapError(Exception):
     """Base for errors that map to an RFC 8620 request- or method-level error type."""
@@ -31,6 +29,30 @@ class ForbiddenError(JmapError):
     type = "forbidden"
 
 
+class UnknownMethodError(JmapError):
+    """The request named a method this deployment does not implement or expose."""
+
+    type = "unknownMethod"
+
+
+class InvalidArgumentsError(JmapError):
+    """A method call's arguments failed validation."""
+
+    type = "invalidArguments"
+
+
+class InvalidResultReferenceError(JmapError):
+    """A `#`-suffixed argument's result reference could not be resolved (RFC 8620 section 3.7)."""
+
+    type = "invalidResultReference"
+
+
+class CannotCalculateChangesError(JmapError):
+    """`sinceState` does not correspond to a known point in this account's history."""
+
+    type = "cannotCalculateChanges"
+
+
 class BackendError(JmapError):
     """An EAS operation failed. `cause` is for server-side logging, never for client responses."""
 
@@ -41,5 +63,5 @@ class BackendError(JmapError):
         super().__init__("an internal error occurred while contacting the mailbox")
 
 
-def map_eas_exception(exc: EASError) -> BackendError:
+def map_eas_exception(exc: Exception) -> BackendError:
     return BackendError(exc)

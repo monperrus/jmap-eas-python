@@ -67,6 +67,20 @@ def test_reconcile_folders_creates_and_removes(tmp_path):
     assert state.current_state(database.conn, "alice", "Mailbox") == "3"
 
 
+def test_reconcile_folders_ignores_non_mail_folder_types(tmp_path):
+    coordinator, database = _coordinator(tmp_path)
+    adapter = EasAdapter(FakeEasClient(
+        folders=[
+            Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox"),
+            Folder(id="2", parent_id="0", type=FolderType.CALENDAR, name="Calendar"),
+            Folder(id="3", parent_id="0", type=FolderType.CONTACTS, name="Contacts"),
+        ],
+        sync_responses={},
+    ))
+    coordinator.reconcile_folders("alice", adapter)
+    assert [m.mailbox_id for m in cache.list_mailboxes(database.conn, "alice")] == ["1"]
+
+
 def test_sync_folder_bootstraps_then_fetches_items(tmp_path):
     coordinator, database = _coordinator(tmp_path)
     adapter = EasAdapter(FakeEasClient(
@@ -124,6 +138,40 @@ def test_sync_folder_pages_until_more_available_is_false(tmp_path):
     emails = cache.list_emails_in_mailbox(database.conn, "alice", "1")
     assert {e.subject for e in emails} == {"First", "Second"}
     assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "3"
+
+
+def test_sync_folder_caps_pages_per_call_and_resumes_on_next_call(tmp_path):
+    database = db.connect(tmp_path / "bridge.sqlite3")
+    coordinator = SyncCoordinator(database, max_pages_per_call=2)
+    folders = [Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")]
+
+    def page(n: int, more: bool):
+        return SyncResult(
+            sync_key=str(n), added=[SyncItem(server_id=f"9:{n}", fields={"Email.Subject": f"S{n}"})],
+            changed=[], deleted=[], more_available=more,
+        )
+
+    adapter = EasAdapter(FakeEasClient(
+        folders=folders,
+        sync_responses={
+            "1": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),  # bootstrap
+                page(2, more=True),
+                page(3, more=True),
+                page(4, more=True),
+            ]
+        },
+    ))
+    coordinator.reconcile_folders("alice", adapter)
+    coordinator.sync_folder("alice", "1", adapter)  # bootstrap + 2 pages (the cap), stops with more pending
+
+    assert len(cache.list_emails_in_mailbox(database.conn, "alice", "1")) == 2
+    assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "3"
+
+    adapter2 = EasAdapter(FakeEasClient(folders=folders, sync_responses={"1": [page(5, more=False)]}))
+    coordinator.sync_folder("alice", "1", adapter2)  # resumes from where it left off
+    assert len(cache.list_emails_in_mailbox(database.conn, "alice", "1")) == 3
+    assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "5"
 
 
 def test_sync_folder_applies_deletes(tmp_path):

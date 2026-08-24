@@ -92,6 +92,30 @@ def list_mailboxes(conn: sqlite3.Connection, account_id: str) -> list[MailboxRec
     return [_mailbox_from_row(row) for row in rows]
 
 
+def count_emails_in_mailbox(conn: sqlite3.Connection, account_id: str, mailbox_id: str) -> tuple[int, int]:
+    """Returns `(total, unread)` for one mailbox."""
+    row = conn.execute(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE seen = 0) FROM emails WHERE account_id = ? AND mailbox_id = ?",
+        (account_id, mailbox_id),
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
+def count_threads_in_mailbox(conn: sqlite3.Connection, account_id: str, mailbox_id: str) -> tuple[int, int]:
+    """Returns `(total, unread)` distinct threads for one mailbox (unread = has >=1 unseen email there)."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*), COUNT(*) FILTER (WHERE unread_count > 0) FROM (
+            SELECT thread_id, COUNT(*) FILTER (WHERE seen = 0) AS unread_count
+            FROM emails WHERE account_id = ? AND mailbox_id = ?
+            GROUP BY thread_id
+        )
+        """,
+        (account_id, mailbox_id),
+    ).fetchone()
+    return int(row[0]), int(row[1])
+
+
 # -- Threads --------------------------------------------------------------------
 
 

@@ -67,6 +67,21 @@ def test_list_folders_returns_folders():
     assert [f.name for f in folders] == ["Inbox"]
 
 
+def test_non_eas_exception_is_also_mapped_to_backend_error():
+    """A library bug (e.g. an unhandled edge case in WBXML parsing) must be redacted
+    exactly like a normal EAS failure, not crash the request with a raw traceback."""
+
+    class BuggyClient(FakeClient):
+        def list_folders(self):
+            raise IndexError("index out of range")
+
+    adapter = EasAdapter(BuggyClient())
+    with pytest.raises(BackendError) as exc_info:
+        adapter.list_folders()
+    assert isinstance(exc_info.value.cause, IndexError)
+    assert "index out of range" not in str(exc_info.value)
+
+
 def test_provision_maps_eas_exception_to_backend_error():
     adapter = EasAdapter(FakeClient(fail=True))
     with pytest.raises(BackendError) as exc_info:
@@ -144,6 +159,7 @@ def test_connect_builds_client_from_account_config(monkeypatch):
         username="alice@example.com",
         device_id="dev1",
         password="secret",
+        api_token="token",
     )
     adapter = EasAdapter.connect(config)
     assert captured["args"] == ("https://mail.example.com/Microsoft-Server-ActiveSync", "alice@example.com", "secret")
