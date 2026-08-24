@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jmap-eas-python"
+version = "0.1.0"
+description = "A JMAP (RFC 8620/8621) bridge in front of an Exchange ActiveSync 16.1 mailbox"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Martin Monperrus" }]
+keywords = ["jmap", "exchange", "activesync", "eas", "email"]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pyactivesync>=0.16.0",
+    "starlette>=0.37",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.8",
+    "ruff>=0.4",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/monperrus/jmap-eas-python"
+Repository = "https://github.com/monperrus/jmap-eas-python"
+Issues = "https://github.com/monperrus/jmap-eas-python/issues"
+
+[project.scripts]
+jmap-eas-server = "jmap_eas.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jmap_eas"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+
+# pyactivesync declares "Typing :: Typed" but ships no py.typed marker yet.
+[[tool.mypy.overrides]]
+module = "pyactivesync.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["jmap_eas"]
