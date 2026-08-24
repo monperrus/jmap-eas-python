@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import email
 import re
+import secrets
 from email import policy as email_policy
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
+from email.utils import formataddr
 from typing import Any
 
-from pyactivesync.models import AttachmentInfo, BodyType
+from pyactivesync.models import AttachmentInfo, BodyType, FolderType
 
 from ..backend.eas import EasAdapter
-from ..errors import BackendError, CannotCalculateChangesError, InvalidArgumentsError
+from ..backend.mapping import MAILBOX_ROLES
+from ..errors import BackendError, CannotCalculateChangesError, ForbiddenError, InvalidArgumentsError
 from ..models import EmailAddress, EmailRecord
 from ..store import cache, state
 from . import blob
@@ -277,6 +280,275 @@ def query(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
     if calculate_total:
         result["total"] = total
     return result
+
+
+CREATE_REQUIRED_KEYWORD = "$draft"
+CREATE_ALLOWED_KEYWORDS = {"$draft", "$seen", "$flagged"}
+UPDATE_SUPPORTED_KEYWORDS = {"$seen", "$flagged"}
+_UPDATE_MUTABLE_TOP_LEVEL = {"keywords", "mailboxIds"}
+_ADDRESS_HEADERS = (("From", "from"), ("To", "to"), ("Cc", "cc"), ("Bcc", "bcc"), ("Reply-To", "replyTo"))
+
+
+def _resolve_bodies(props: dict[str, Any]) -> tuple[str | None, str | None]:
+    body_values = props.get("bodyValues") or {}
+
+    def resolve(parts: Any) -> str | None:
+        if not parts:
+            return None
+        part_id = parts[0].get("partId") if isinstance(parts[0], dict) else None
+        entry = body_values.get(part_id) if part_id else None
+        return entry.get("value") if isinstance(entry, dict) else None
+
+    return resolve(props.get("textBody")), resolve(props.get("htmlBody"))
+
+
+def _compose_message(env: Environment, props: dict[str, Any]) -> tuple[Message | None, dict[str, Any] | None]:
+    """Builds a stdlib `EmailMessage` from JMAP Email creation properties.
+
+    Returns `(message, None)` on success, or `(None, error)` where `error` is
+    the per-object `notCreated` value (e.g. an unresolvable attachment blobId).
+    """
+    message = EmailMessage(policy=email_policy.SMTP)
+    subject = props.get("subject")
+    if subject is not None:
+        if not isinstance(subject, str):
+            return None, {"type": "invalidProperties", "properties": ["subject"]}
+        message["Subject"] = subject
+
+    for header, key in _ADDRESS_HEADERS:
+        addresses = props.get(key)
+        if not addresses:
+            continue
+        if not isinstance(addresses, list):
+            return None, {"type": "invalidProperties", "properties": [key]}
+        formatted = []
+        for address in addresses:
+            email_address = address.get("email") if isinstance(address, dict) else None
+            if not email_address:
+                return None, {"type": "invalidProperties", "properties": [key]}
+            name = address.get("name")
+            formatted.append(formataddr((name, email_address)) if name else email_address)
+        message[header] = ", ".join(formatted)
+
+    in_reply_to = props.get("inReplyTo")
+    if in_reply_to:
+        message["In-Reply-To"] = " ".join(in_reply_to)
+    references = props.get("references")
+    if references:
+        message["References"] = " ".join(references)
+    for header in props.get("headers") or []:
+        name = header.get("name") if isinstance(header, dict) else None
+        value = header.get("value") if isinstance(header, dict) else None
+        if not name or value is None:
+            return None, {"type": "invalidProperties", "properties": ["headers"]}
+        message[name] = value
+
+    text_body, html_body = _resolve_bodies(props)
+    if text_body is not None and html_body is not None:
+        message.set_content(text_body)
+        message.add_alternative(html_body, subtype="html")
+    elif html_body is not None:
+        message.set_content(html_body, subtype="html")
+    elif text_body is not None:
+        message.set_content(text_body)
+    else:
+        message.set_content("")
+
+    for attachment in props.get("attachments") or []:
+        if not isinstance(attachment, dict) or not attachment.get("blobId"):
+            return None, {"type": "invalidProperties", "properties": ["attachments"]}
+        try:
+            locator = blob.decode_blob_id(attachment["blobId"])
+        except ValueError:
+            return None, {"type": "invalidProperties", "properties": ["attachments"]}
+        resolved = blob.resolve_blob(locator, account_id=env.account_id, adapter=env.adapter,
+                                      database=env.database)
+        if resolved is None:
+            return None, {"type": "invalidProperties", "properties": ["attachments"]}
+        data, default_content_type = resolved
+        content_type = attachment.get("type") or default_content_type
+        maintype, _, subtype = content_type.partition("/")
+        message.add_attachment(data, maintype=maintype or "application", subtype=subtype or "octet-stream",
+                                filename=attachment.get("name"))
+    return message, None
+
+
+def _validate_create(env: Environment, props: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None, bool, bool]:
+    """Returns `(error, draftsMailboxId, read, flagged)`; only draft creation is supported (plan.md's M2 note)."""
+    mailbox_ids = props.get("mailboxIds")
+    if not isinstance(mailbox_ids, dict) or list(mailbox_ids.values()) != [True]:
+        return {"type": "invalidProperties", "properties": ["mailboxIds"]}, None, False, False
+    mailbox_id = next(iter(mailbox_ids))
+
+    with env.database.transaction() as conn:
+        target = cache.get_mailbox(conn, env.account_id, mailbox_id)
+    role = MAILBOX_ROLES.get(FolderType(target.folder_type)) if target is not None else None
+    if role != "drafts":
+        return {"type": "invalidProperties", "properties": ["mailboxIds"]}, None, False, False
+
+    keywords = props.get("keywords")
+    if not isinstance(keywords, dict) or not keywords.get(CREATE_REQUIRED_KEYWORD):
+        return {"type": "invalidProperties", "properties": ["keywords"]}, None, False, False
+    unsupported = {k for k, v in keywords.items() if v} - CREATE_ALLOWED_KEYWORDS
+    if unsupported:
+        return {"type": "invalidProperties", "properties": ["keywords"]}, None, False, False
+
+    return None, mailbox_id, bool(keywords.get("$seen")), bool(keywords.get("$flagged"))
+
+
+def _resolve_patch_object(current: dict[str, bool], patch: dict[str, Any], prefix: str) -> dict[str, bool]:
+    """A JMAP patch object's value for `prefix`: full replacement if `prefix` is a top-level
+    key, else `current` with every `prefix/subkey` entry applied (RFC 8620 section 5.3)."""
+    if prefix in patch:
+        value = patch[prefix]
+        return dict(value) if isinstance(value, dict) else {}
+    result = dict(current)
+    for key, value in patch.items():
+        if not key.startswith(prefix + "/"):
+            continue
+        subkey = key[len(prefix) + 1:].replace("~1", "/").replace("~0", "~")
+        if value:
+            result[subkey] = True
+        else:
+            result.pop(subkey, None)
+    return result
+
+
+def _apply_update(env: Environment, email_id: str, record: EmailRecord, patch: dict[str, Any]) -> dict[str, Any] | None:
+    """Applies a supported update patch. Returns an error dict, or `None` on success."""
+    unknown = sorted({key.split("/")[0] for key in patch} - _UPDATE_MUTABLE_TOP_LEVEL)
+    if unknown:
+        return {"type": "invalidProperties", "properties": unknown}
+
+    seen: bool | None = None
+    flagged: bool | None = None
+    if "keywords" in patch or any(k.startswith("keywords/") for k in patch):
+        new_keywords = _resolve_patch_object(_keywords(record), patch, "keywords")
+        if set(k for k, v in new_keywords.items() if v) - UPDATE_SUPPORTED_KEYWORDS:
+            return {"type": "invalidProperties", "properties": ["keywords"]}
+        seen = bool(new_keywords.get("$seen"))
+        flagged = bool(new_keywords.get("$flagged"))
+
+    new_mailbox_id: str | None = None
+    if "mailboxIds" in patch or any(k.startswith("mailboxIds/") for k in patch):
+        new_mailbox_ids = _resolve_patch_object({record.mailbox_id: True}, patch, "mailboxIds")
+        targets = [k for k, v in new_mailbox_ids.items() if v]
+        if len(targets) != 1:
+            return {"type": "invalidProperties", "properties": ["mailboxIds"]}
+        new_mailbox_id = targets[0]
+        if new_mailbox_id != record.mailbox_id:
+            if not env.policy.allow_moves:
+                return {"type": ForbiddenError.type}
+            with env.database.transaction() as conn:
+                target = cache.get_mailbox(conn, env.account_id, new_mailbox_id)
+            if target is None:
+                return {"type": "invalidProperties", "properties": ["mailboxIds"]}
+
+    try:
+        if seen is not None or flagged is not None:
+            status = env.sync.set_email_keywords(env.account_id, email_id, env.adapter, seen=seen, flagged=flagged)
+            if status != "1":
+                return {"type": "serverFail"}
+        if new_mailbox_id is not None and new_mailbox_id != record.mailbox_id:
+            outcome = env.sync.move_email(env.account_id, email_id, new_mailbox_id, env.adapter)
+            if outcome != "moved":
+                return {"type": "serverFail"}
+    except BackendError:
+        return {"type": "serverFail"}
+    return None
+
+
+def set_(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
+    """`Email/set`. Named `set_` to avoid shadowing the builtin `set` used elsewhere in this module."""
+    create = arguments.get("create") or {}
+    update = arguments.get("update") or {}
+    destroy = arguments.get("destroy") or []
+    if not isinstance(create, dict) or not isinstance(update, dict) or not isinstance(destroy, list):
+        raise InvalidArgumentsError("create/update must be objects and destroy must be an array")
+
+    with env.database.transaction() as conn:
+        old_state = state.current_state(conn, env.account_id, "Email")
+
+    created: dict[str, Any] = {}
+    not_created: dict[str, Any] = {}
+    for client_id, props in create.items():
+        if not isinstance(props, dict):
+            not_created[client_id] = {"type": "invalidProperties"}
+            continue
+        error, mailbox_id, read, flagged = _validate_create(env, props)
+        if error is not None:
+            not_created[client_id] = error
+            continue
+        message, error = _compose_message(env, props)
+        if error is not None:
+            not_created[client_id] = error
+            continue
+        assert message is not None and mailbox_id is not None
+        try:
+            status, email_id = env.sync.create_draft(
+                env.account_id, mailbox_id, message, read=read, flagged=flagged,
+                client_id=secrets.token_urlsafe(16), adapter=env.adapter,
+            )
+        except BackendError:
+            not_created[client_id] = {"type": "serverFail"}
+            continue
+        if status != "1" or email_id is None:
+            not_created[client_id] = {"type": "serverFail"}
+            continue
+        created[client_id] = {"id": email_id}
+
+    updated: dict[str, None] = {}
+    not_updated: dict[str, Any] = {}
+    for email_id, patch in update.items():
+        with env.database.transaction() as conn:
+            record = cache.get_email(conn, env.account_id, email_id)
+        if record is None:
+            not_updated[email_id] = {"type": "notFound"}
+            continue
+        if not isinstance(patch, dict):
+            not_updated[email_id] = {"type": "invalidProperties"}
+            continue
+        error = _apply_update(env, email_id, record, patch)
+        if error is not None:
+            not_updated[email_id] = error
+            continue
+        updated[email_id] = None
+
+    destroyed: list[str] = []
+    not_destroyed: dict[str, Any] = {}
+    for email_id in destroy:
+        with env.database.transaction() as conn:
+            record = cache.get_email(conn, env.account_id, email_id)
+        if record is None:
+            not_destroyed[email_id] = {"type": "notFound"}
+            continue
+        if not env.policy.allow_delete:
+            not_destroyed[email_id] = {"type": ForbiddenError.type}
+            continue
+        try:
+            delete_status = env.sync.delete_email(env.account_id, email_id, env.adapter)
+        except BackendError:
+            not_destroyed[email_id] = {"type": "serverFail"}
+            continue
+        if delete_status != "1":
+            not_destroyed[email_id] = {"type": "serverFail"}
+            continue
+        destroyed.append(email_id)
+
+    with env.database.transaction() as conn:
+        new_state = state.current_state(conn, env.account_id, "Email")
+
+    return {
+        "accountId": env.account_id,
+        "oldState": old_state,
+        "newState": new_state,
+        "created": created,
+        "updated": updated,
+        "destroyed": destroyed,
+        "notCreated": not_created,
+        "notUpdated": not_updated,
+        "notDestroyed": not_destroyed,
+    }
 
 
 def changes(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:

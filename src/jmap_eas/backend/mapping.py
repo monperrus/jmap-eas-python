@@ -9,6 +9,8 @@ metadata alone -- `Email/get` fetches those on demand (see `jmap/email.py`).
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
+from email.message import Message
 from email.utils import getaddresses
 
 from pyactivesync.models import Folder, FolderType, SyncItem
@@ -98,4 +100,37 @@ def map_sync_item_to_email(
         received_at=fields.get("Email.DateReceived"),
         seen=fields.get("Email.Read") == "1",
         flagged=fields.get("Email.Status") == "2",
+    )
+
+
+def map_draft_message_to_email(
+    *, account_id: str, mailbox_id: str, server_id: str, thread_id: str, email_id: str, message: Message,
+    read: bool, flagged: bool,
+) -> EmailRecord:
+    """Build the cache row for a just-created draft directly from the composed message.
+
+    No round trip to EAS is needed for these properties: we authored the
+    message ourselves, so its headers are standard comma-separated RFC 5322
+    lists (unlike EAS's `;`-separated `Sync` fields) and can be parsed with
+    `email.utils.getaddresses` directly.
+    """
+
+    def addresses(header: str) -> list[EmailAddress]:
+        return [EmailAddress(email=addr, name=name or None) for name, addr in getaddresses(message.get_all(header, []))
+                if addr]
+
+    return EmailRecord(
+        account_id=account_id,
+        email_id=email_id,
+        mailbox_id=mailbox_id,
+        server_id=server_id,
+        thread_id=thread_id,
+        subject=message.get("Subject"),
+        from_addresses=addresses("From"),
+        to_addresses=addresses("To"),
+        cc_addresses=addresses("Cc"),
+        reply_to_addresses=addresses("Reply-To"),
+        received_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        seen=read,
+        flagged=flagged,
     )

@@ -59,6 +59,17 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX change_log_by_type ON change_log (account_id, type, seq);
     """,
+    """
+    CREATE TABLE uploaded_blobs (
+        account_id TEXT NOT NULL,
+        blob_id TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        data BLOB NOT NULL,
+        size INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, blob_id)
+    );
+    """,
 )
 
 

@@ -3,15 +3,14 @@ from __future__ import annotations
 from jmap_eas import policy
 
 
-def test_methods_cover_the_m1_read_surface():
+def test_methods_cover_the_m1_and_m2_surface():
     assert set(policy.METHODS) == {
-        "Core/echo", "Mailbox/get", "Mailbox/query", "Mailbox/changes",
-        "Email/get", "Email/query", "Email/changes", "Thread/get",
+        "Core/echo", "Mailbox/get", "Mailbox/query", "Mailbox/changes", "Mailbox/set",
+        "Email/get", "Email/query", "Email/changes", "Email/set", "Thread/get",
     }
 
 
-def test_no_mutating_methods_registered_yet():
-    assert not any(name.endswith("/set") for name in policy.METHODS)
+def test_no_submission_methods_registered_yet():
     assert not any(name.startswith("EmailSubmission") for name in policy.METHODS)
 
 

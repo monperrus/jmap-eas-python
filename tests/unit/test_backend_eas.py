@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 from pyactivesync.exceptions import StatusError
-from pyactivesync.models import BodyType, FetchedItem, Folder, FolderType, ItemBody, SyncItem, SyncResult
+from pyactivesync.models import (
+    BodyType,
+    EmailAddResult,
+    EmailChangesResult,
+    FetchedItem,
+    Folder,
+    FolderType,
+    ItemBody,
+    SyncItem,
+    SyncResult,
+)
 
 import jmap_eas.backend.eas as eas_module
 from jmap_eas.backend.eas import EasAdapter
@@ -51,6 +61,34 @@ class FakeClient:
         if self.fail:
             raise StatusError("ItemOperations", "12")
         return b"attachment-bytes"
+
+    def create_folder(self, display_name, parent_id="0", type=FolderType.USER_MAIL):
+        if self.fail:
+            raise StatusError("FolderCreate", "2")
+        return Folder(id="new-folder", parent_id=parent_id, type=type, name=display_name)
+
+    def update_folder(self, folder_id, display_name, parent_id="0"):
+        if self.fail:
+            raise StatusError("FolderUpdate", "2")
+
+    def delete_folder(self, folder_id):
+        if self.fail:
+            raise StatusError("FolderDelete", "2")
+
+    def apply_email_changes(self, folder_id, sync_key, changes, *, deletes_as_moves=True):
+        if self.fail:
+            raise StatusError("Sync", "12")
+        return EmailChangesResult(sync_key="2", statuses={c.server_id: "1" for c in changes})
+
+    def create_email_draft(self, folder_id, sync_key, message, *, read=False, flagged=False, client_id=None):
+        if self.fail:
+            raise StatusError("Sync", "12")
+        return EmailAddResult(sync_key="2", client_id=client_id or "cid", status="1", server_id="9:new")
+
+    def move_item(self, item_id, src_folder_id, dst_folder_id):
+        if self.fail:
+            raise StatusError("MoveItems", "1")
+        return "10:new"
 
     def close(self) -> None:
         self.closed = True
@@ -135,6 +173,77 @@ def test_fetch_attachment_maps_eas_exception_to_backend_error():
     adapter = EasAdapter(FakeClient(fail=True))
     with pytest.raises(BackendError):
         adapter.fetch_attachment("ref")
+
+
+def test_create_folder_returns_folder():
+    adapter = EasAdapter(FakeClient())
+    folder = adapter.create_folder("New Folder", "0")
+    assert folder.id == "new-folder"
+    assert folder.name == "New Folder"
+
+
+def test_create_folder_maps_eas_exception():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.create_folder("New Folder")
+
+
+def test_update_folder_maps_eas_exception():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.update_folder("1", "Renamed")
+
+
+def test_delete_folder_maps_eas_exception():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.delete_folder("1")
+
+
+def test_apply_email_changes_returns_statuses():
+    from pyactivesync.models import EmailChange
+
+    adapter = EasAdapter(FakeClient())
+    result = adapter.apply_email_changes("1", "5", [EmailChange("9:1", read=True)])
+    assert result.sync_key == "2"
+    assert result.statuses == {"9:1": "1"}
+
+
+def test_apply_email_changes_maps_eas_exception():
+    from pyactivesync.models import EmailChange
+
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.apply_email_changes("1", "5", [EmailChange("9:1", read=True)])
+
+
+def test_create_email_draft_returns_result():
+    from email.message import EmailMessage
+
+    adapter = EasAdapter(FakeClient())
+    result = adapter.create_email_draft("1", "5", EmailMessage(), client_id="cid1")
+    assert result.server_id == "9:new"
+    assert result.status == "1"
+    assert result.client_id == "cid1"
+
+
+def test_create_email_draft_maps_eas_exception():
+    from email.message import EmailMessage
+
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.create_email_draft("1", "5", EmailMessage())
+
+
+def test_move_item_returns_new_server_id():
+    adapter = EasAdapter(FakeClient())
+    assert adapter.move_item("9:1", "1", "2") == "10:new"
+
+
+def test_move_item_maps_eas_exception():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.move_item("9:1", "1", "2")
 
 
 def test_close_closes_underlying_client():

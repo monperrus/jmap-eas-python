@@ -211,3 +211,30 @@ def list_emails_for_account(conn: sqlite3.Connection, account_id: str) -> list[E
     """All cached emails for `account_id`, across every mailbox. `Email/query` filters and sorts these itself."""
     rows = conn.execute("SELECT * FROM emails WHERE account_id = ?", (account_id,)).fetchall()
     return [_email_from_row(row) for row in rows]
+
+
+def set_email_keywords(conn: sqlite3.Connection, account_id: str, email_id: str, *, seen: bool, flagged: bool) -> None:
+    conn.execute(
+        "UPDATE emails SET seen = ?, flagged = ? WHERE account_id = ? AND email_id = ?",
+        (int(seen), int(flagged), account_id, email_id),
+    )
+
+
+def move_email(
+    conn: sqlite3.Connection, account_id: str, email_id: str, new_mailbox_id: str, new_server_id: str
+) -> None:
+    """Update an email's EAS locator after a move (plan.md section 3): the local `email_id` is unchanged."""
+    conn.execute(
+        "UPDATE emails SET mailbox_id = ?, server_id = ? WHERE account_id = ? AND email_id = ?",
+        (new_mailbox_id, new_server_id, account_id, email_id),
+    )
+
+
+def delete_emails_in_mailbox(conn: sqlite3.Connection, account_id: str, mailbox_id: str) -> list[str]:
+    """Delete every cached email in a mailbox (a folder destroy cascades). Returns the removed email ids."""
+    rows = conn.execute(
+        "SELECT email_id FROM emails WHERE account_id = ? AND mailbox_id = ?", (account_id, mailbox_id)
+    ).fetchall()
+    email_ids = [str(row["email_id"]) for row in rows]
+    conn.execute("DELETE FROM emails WHERE account_id = ? AND mailbox_id = ?", (account_id, mailbox_id))
+    return email_ids

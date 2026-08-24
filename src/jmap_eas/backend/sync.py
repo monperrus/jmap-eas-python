@@ -11,9 +11,12 @@ from __future__ import annotations
 import secrets
 import sqlite3
 import threading
+from collections.abc import Callable
+from email.message import Message
 
-from pyactivesync.models import SyncItem
+from pyactivesync.models import EmailChange, FolderType, SyncItem
 
+from ..models import EmailRecord, MailboxRecord
 from ..store import cache, state
 from ..store.db import Database
 from . import mapping
@@ -118,3 +121,150 @@ class SyncCoordinator:
         )
         cache.upsert_email(conn, record)
         state.append_change(conn, account_id, "Email", email_id, "created" if is_create else "updated")
+
+    # -- Mailbox mutations (M2) ------------------------------------------------------
+
+    def create_mailbox(self, account_id: str, name: str, parent_id: str, adapter: EasAdapter) -> MailboxRecord:
+        folder = adapter.create_folder(name, parent_id, type=FolderType.USER_MAIL)
+        record = mapping.map_folder_to_mailbox(account_id, folder)
+        with self._database.transaction() as conn:
+            cache.upsert_mailbox(conn, record)
+            state.append_change(conn, account_id, "Mailbox", record.mailbox_id, "created")
+        return record
+
+    def update_mailbox(self, account_id: str, mailbox_id: str, name: str, parent_id: str, adapter: EasAdapter) -> None:
+        adapter.update_folder(mailbox_id, name, parent_id)
+        with self._database.transaction() as conn:
+            mailbox = cache.get_mailbox(conn, account_id, mailbox_id)
+            assert mailbox is not None
+            cache.upsert_mailbox(conn, MailboxRecord(account_id, mailbox_id, parent_id, name, mailbox.folder_type,
+                                                       mailbox.sync_key))
+            state.append_change(conn, account_id, "Mailbox", mailbox_id, "updated")
+
+    def delete_mailbox(self, account_id: str, mailbox_id: str, adapter: EasAdapter) -> None:
+        """Deletes the EAS folder, then cascades the deletion to its cached emails (plan.md's Mailbox destroy)."""
+        adapter.delete_folder(mailbox_id)
+        with self._folder_lock(account_id, mailbox_id):
+            with self._database.transaction() as conn:
+                removed_email_ids = cache.delete_emails_in_mailbox(conn, account_id, mailbox_id)
+                for email_id in removed_email_ids:
+                    state.append_change(conn, account_id, "Email", email_id, "destroyed")
+                cache.delete_mailbox(conn, account_id, mailbox_id)
+                state.append_change(conn, account_id, "Mailbox", mailbox_id, "destroyed")
+
+    # -- Email mutations (M2) --------------------------------------------------------
+
+    def _apply_email_change(
+        self, account_id: str, email_id: str, adapter: EasAdapter,
+        build_change: Callable[[str], EmailChange], *, deletes_as_moves: bool = True,
+    ) -> tuple[str, EmailRecord] | None:
+        """Runs one `EmailChange` against its email's own folder, holding that folder's lock.
+
+        Commits the returned SyncKey even when the per-item status isn't `"1"`
+        (plan.md's M2 note): a caller must still record the advanced key.
+        Returns `None` if the email isn't cached, else `(status, record)`
+        where `record` is the email's state *before* this change.
+        """
+        with self._database.transaction() as conn:
+            record = cache.get_email(conn, account_id, email_id)
+        if record is None:
+            return None
+        change = build_change(record.server_id)
+        with self._folder_lock(account_id, record.mailbox_id):
+            with self._database.transaction() as conn:
+                mailbox = cache.get_mailbox(conn, account_id, record.mailbox_id)
+            assert mailbox is not None
+            result = adapter.apply_email_changes(
+                record.mailbox_id, mailbox.sync_key, [change], deletes_as_moves=deletes_as_moves
+            )
+            status = result.statuses.get(record.server_id, "1")
+            with self._database.transaction() as conn:
+                cache.set_mailbox_sync_key(conn, account_id, record.mailbox_id, result.sync_key)
+        return status, record
+
+    def set_email_keywords(
+        self, account_id: str, email_id: str, adapter: EasAdapter, *, seen: bool | None, flagged: bool | None
+    ) -> str | None:
+        """Applies a read/flag change. Returns the EAS per-item status, or `None` if not cached."""
+        outcome = self._apply_email_change(
+            account_id, email_id, adapter, lambda server_id: EmailChange(server_id, read=seen, flagged=flagged)
+        )
+        if outcome is None:
+            return None
+        status, record = outcome
+        if status == "1":
+            new_seen = record.seen if seen is None else seen
+            new_flagged = record.flagged if flagged is None else flagged
+            with self._database.transaction() as conn:
+                cache.set_email_keywords(conn, account_id, email_id, seen=new_seen, flagged=new_flagged)
+                state.append_change(conn, account_id, "Email", email_id, "updated")
+        return status
+
+    def delete_email(self, account_id: str, email_id: str, adapter: EasAdapter) -> str | None:
+        """Deletes (moves to Deleted Items) one email. Returns the EAS per-item status, or `None` if not cached."""
+        outcome = self._apply_email_change(
+            account_id, email_id, adapter, lambda server_id: EmailChange(server_id, delete=True),
+            deletes_as_moves=True,
+        )
+        if outcome is None:
+            return None
+        status, _record = outcome
+        if status == "1":
+            with self._database.transaction() as conn:
+                cache.delete_email(conn, account_id, email_id)
+                state.append_change(conn, account_id, "Email", email_id, "destroyed")
+        return status
+
+    def move_email(self, account_id: str, email_id: str, dst_mailbox_id: str, adapter: EasAdapter) -> str | None:
+        """Moves one email to another mailbox, keeping its local `email_id` (plan.md section 3).
+
+        Returns `"moved"`/`"unchanged"`, or `None` if the email isn't cached.
+        Both folders are locked (sorted, to avoid deadlocking a concurrent move
+        in the opposite direction) so a concurrent sync of either folder can't
+        race the cache update, even though `MoveItems` itself has no SyncKey.
+        """
+        with self._database.transaction() as conn:
+            record = cache.get_email(conn, account_id, email_id)
+        if record is None:
+            return None
+        src_mailbox_id = record.mailbox_id
+        if src_mailbox_id == dst_mailbox_id:
+            return "unchanged"
+        first, second = sorted((src_mailbox_id, dst_mailbox_id))
+        with self._folder_lock(account_id, first), self._folder_lock(account_id, second):
+            new_server_id = adapter.move_item(record.server_id, src_mailbox_id, dst_mailbox_id)
+            with self._database.transaction() as conn:
+                cache.move_email(conn, account_id, email_id, dst_mailbox_id, new_server_id)
+                state.append_change(conn, account_id, "Email", email_id, "updated")
+        return "moved"
+
+    def create_draft(
+        self, account_id: str, mailbox_id: str, message: Message, *, read: bool, flagged: bool, client_id: str,
+        adapter: EasAdapter,
+    ) -> tuple[str, str | None]:
+        """Composes one draft via `Sync Add`, holding the Drafts folder's lock.
+
+        Commits the returned SyncKey even on a non-`"1"` status (plan.md's M2
+        note). Returns `(status, email_id)`; `email_id` is `None` on failure.
+        """
+        with self._folder_lock(account_id, mailbox_id):
+            with self._database.transaction() as conn:
+                mailbox = cache.get_mailbox(conn, account_id, mailbox_id)
+            assert mailbox is not None
+            result = adapter.create_email_draft(
+                mailbox_id, mailbox.sync_key, message, read=read, flagged=flagged, client_id=client_id
+            )
+            with self._database.transaction() as conn:
+                cache.set_mailbox_sync_key(conn, account_id, mailbox_id, result.sync_key)
+                if result.status != "1" or result.server_id is None:
+                    return result.status, None
+                email_id = secrets.token_urlsafe(16)
+                thread_key = mapping.thread_key_for_item(mailbox_id, result.server_id, message.get("Subject"))
+                thread_id = cache.get_or_create_thread_id(conn, account_id, thread_key, secrets.token_urlsafe(16))
+                record = mapping.map_draft_message_to_email(
+                    account_id=account_id, mailbox_id=mailbox_id, server_id=result.server_id,
+                    thread_id=thread_id, email_id=email_id, message=message, read=read, flagged=flagged,
+                )
+                cache.upsert_email(conn, record)
+                state.append_change(conn, account_id, "Email", email_id, "created")
+            return result.status, email_id

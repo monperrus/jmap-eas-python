@@ -2,20 +2,34 @@ from __future__ import annotations
 
 import base64
 
-from pyactivesync.models import BodyType, FetchedItem, Folder, FolderType, ItemBody, SyncResult
+from pyactivesync.models import (
+    BodyType,
+    EmailAddResult,
+    EmailChangesResult,
+    FetchedItem,
+    Folder,
+    FolderType,
+    ItemBody,
+    SyncItem,
+    SyncResult,
+)
 from starlette.testclient import TestClient
 
 from jmap_eas.app import create_app
 from jmap_eas.backend.eas import EasAdapter
-from jmap_eas.config import AccountConfig, AppConfig, ServerConfig
+from jmap_eas.config import AccountConfig, AppConfig, PolicyConfig, ServerConfig
 from jmap_eas.registry import AccountRegistry
 
 
 class FakeClient:
-    def __init__(self, *, folders=None, sync_results=None, fetched_item=None):
+    def __init__(self, *, folders=None, sync_results=None, fetched_item=None, new_folder=None):
         self._folders = folders or []
         self._sync_results = {k: list(v) for k, v in (sync_results or {}).items()}
         self._fetched_item = fetched_item
+        self._new_folder = new_folder
+        self.delete_folder_calls: list[str] = []
+        self.draft_calls: list[tuple] = []
+        self.apply_calls: list[tuple] = []
 
     def provision(self):
         return "policy-key"
@@ -31,6 +45,29 @@ class FakeClient:
 
     def fetch_attachment(self, file_reference):
         return b"attachment-bytes"
+
+    def create_folder(self, display_name, parent_id="0", type=FolderType.USER_MAIL):
+        folder = self._new_folder or Folder(id="new1", parent_id=parent_id, type=type, name=display_name)
+        self._folders.append(folder)
+        return folder
+
+    def update_folder(self, folder_id, display_name, parent_id="0"):
+        pass
+
+    def delete_folder(self, folder_id):
+        self.delete_folder_calls.append(folder_id)
+        self._folders = [f for f in self._folders if f.id != folder_id]
+
+    def apply_email_changes(self, folder_id, sync_key, changes, *, deletes_as_moves=True):
+        self.apply_calls.append((folder_id, sync_key, list(changes), deletes_as_moves))
+        return EmailChangesResult(sync_key="new-key", statuses={c.server_id: "1" for c in changes})
+
+    def create_email_draft(self, folder_id, sync_key, message, *, read=False, flagged=False, client_id=None):
+        self.draft_calls.append((folder_id, sync_key, message, read, flagged, client_id))
+        return EmailAddResult(sync_key="new-key", client_id=client_id or "cid", status="1", server_id="9:new")
+
+    def move_item(self, item_id, src_folder_id, dst_folder_id):
+        return "10:new"
 
     def close(self):
         pass
@@ -53,8 +90,11 @@ def _basic(username: str, password: str) -> dict[str, str]:
     return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
 
 
-def _app_with_fake_client(tmp_path, client: FakeClient):
-    config = AppConfig(server=ServerConfig(db_path=str(tmp_path / "bridge.sqlite3")), accounts={"alice": _account()})
+def _app_with_fake_client(tmp_path, client: FakeClient, *, policy: PolicyConfig | None = None):
+    config = AppConfig(
+        server=ServerConfig(db_path=str(tmp_path / "bridge.sqlite3")), accounts={"alice": _account()},
+        policy=policy or PolicyConfig(),
+    )
     app = create_app(config)
     app.state.jmap_eas.registry = AccountRegistry(
         config.accounts, adapter_factory=lambda cfg: EasAdapter(client)
@@ -196,3 +236,157 @@ def test_download_invalid_blob_id(tmp_path):
     with TestClient(app) as client:
         response = client.get("/download/alice/not-a-blob-id/x", headers=_basic("alice", "bridge-token"))
         assert response.status_code == 404
+
+
+# -- upload ---------------------------------------------------------------------------
+
+
+def test_upload_requires_auth(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post("/upload/alice", content=b"hello")
+        assert response.status_code == 401
+
+
+def test_upload_then_download_round_trips(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/upload/alice", headers={**_basic("alice", "bridge-token"), "Content-Type": "text/plain"},
+            content=b"hello world",
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["accountId"] == "alice"
+        assert body["size"] == 11
+        assert body["type"] == "text/plain"
+
+        download = client.get(f"/download/alice/{body['blobId']}/f.txt", headers=_basic("alice", "bridge-token"))
+        assert download.status_code == 200
+        assert download.content == b"hello world"
+        assert download.headers["content-type"].startswith("text/plain")
+
+
+def test_upload_requires_matching_account(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post("/upload/bob", headers=_basic("alice", "bridge-token"), content=b"x")
+        assert response.status_code == 404
+
+
+# -- Mailbox/set ------------------------------------------------------------------------
+
+
+def test_mailbox_set_create_and_destroy(tmp_path):
+    client_fake = FakeClient(new_folder=Folder(id="new1", parent_id="0", type=FolderType.USER_MAIL, name="Test"))
+    app = _app_with_fake_client(tmp_path, client_fake)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["created"] == {"c1": {"id": "new1"}}
+
+        destroy_response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
+        )
+        destroy_result = destroy_response.json()["methodResponses"][0][1]
+        assert destroy_result["destroyed"] == ["new1"]
+        assert client_fake.delete_folder_calls == ["new1"]
+
+
+def test_mailbox_set_destroy_forbidden_by_policy(tmp_path):
+    client_fake = FakeClient(new_folder=Folder(id="new1", parent_id="0", type=FolderType.USER_MAIL, name="Test"))
+    app = _app_with_fake_client(tmp_path, client_fake, policy=PolicyConfig(allow_delete=False))
+    with TestClient(app) as client:
+        client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
+        )
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["notDestroyed"]["new1"]["type"] == "forbidden"
+        assert client_fake.delete_folder_calls == []
+
+
+# -- Email/set --------------------------------------------------------------------------
+
+
+def test_email_set_create_draft_with_uploaded_attachment(tmp_path):
+    client_fake = FakeClient(
+        folders=[Folder(id="3", parent_id="0", type=FolderType.DRAFTS, name="Drafts")],
+        sync_results={
+            "3": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+                SyncResult(sync_key="2", added=[], changed=[], deleted=[], more_available=False),
+            ]
+        },
+    )
+    app = _app_with_fake_client(tmp_path, client_fake)
+    with TestClient(app) as client:
+        # Sync once so the Drafts mailbox is cached (needed for the mailboxIds role check).
+        client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
+        )
+
+        upload = client.post(
+            "/upload/alice", headers={**_basic("alice", "bridge-token"), "Content-Type": "text/plain"},
+            content=b"attachment data",
+        )
+        blob_id = upload.json()["blobId"]
+
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Email/set", {
+                "accountId": "alice",
+                "create": {
+                    "c1": {
+                        "mailboxIds": {"3": True},
+                        "keywords": {"$draft": True},
+                        "subject": "Draft",
+                        "attachments": [{"blobId": blob_id, "name": "f.txt", "type": "text/plain"}],
+                    }
+                },
+            }, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["notCreated"] == {}
+        assert "id" in result["created"]["c1"]
+        assert client_fake.draft_calls[0][0] == "3"
+
+
+def test_email_set_destroy_forbidden_by_policy(tmp_path):
+    client_fake = FakeClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_results={
+            "1": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+                SyncResult(
+                    sync_key="2",
+                    added=[SyncItem(server_id="9:1", fields={"Email.Subject": "Hi"})],
+                    changed=[], deleted=[], more_available=False,
+                ),
+            ]
+        },
+    )
+    app = _app_with_fake_client(tmp_path, client_fake, policy=PolicyConfig(allow_delete=False))
+    with TestClient(app) as client:
+        mailbox_get = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+        )
+        email_id = mailbox_get.json()["methodResponses"][0][1]["ids"][0]
+
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Email/set", {"accountId": "alice", "destroy": [email_id]}, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["notDestroyed"][email_id]["type"] == "forbidden"
+        assert client_fake.apply_calls == []

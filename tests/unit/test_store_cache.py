@@ -105,6 +105,39 @@ def test_delete_email(tmp_path):
     assert cache.get_email(database.conn, "alice", "e1") is None
 
 
+def test_set_email_keywords(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email(seen=False, flagged=False))
+        cache.set_email_keywords(conn, "alice", "e1", seen=True, flagged=True)
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.seen is True
+    assert stored.flagged is True
+
+
+def test_move_email_updates_locator_but_keeps_id(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email(mailbox_id="1", server_id="9:1"))
+        cache.move_email(conn, "alice", "e1", "2", "10:1")
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.email_id == "e1"
+    assert stored.mailbox_id == "2"
+    assert stored.server_id == "10:1"
+
+
+def test_delete_emails_in_mailbox_returns_removed_ids(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email(email_id="e1", mailbox_id="1"))
+        cache.upsert_email(conn, _email(email_id="e2", mailbox_id="1", server_id="9:2"))
+        cache.upsert_email(conn, _email(email_id="e3", mailbox_id="2", server_id="9:3"))
+        removed = cache.delete_emails_in_mailbox(conn, "alice", "1")
+    assert set(removed) == {"e1", "e2"}
+    assert cache.list_emails_in_mailbox(database.conn, "alice", "1") == []
+    assert len(cache.list_emails_in_mailbox(database.conn, "alice", "2")) == 1
+
+
 def test_find_email_id_by_server_id(tmp_path):
     database = _db(tmp_path)
     with database.transaction() as conn:

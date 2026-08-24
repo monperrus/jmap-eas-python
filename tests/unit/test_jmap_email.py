@@ -3,15 +3,26 @@ from __future__ import annotations
 from email.message import EmailMessage as StdEmailMessage
 
 import pytest
-from pyactivesync.models import AttachmentInfo, BodyType, FetchedItem, ItemBody
+from pyactivesync.exceptions import StatusError
+from pyactivesync.models import (
+    AttachmentInfo,
+    BodyType,
+    EmailAddResult,
+    EmailChangesResult,
+    FetchedItem,
+    FolderType,
+    ItemBody,
+)
 
 from jmap_eas.backend.eas import EasAdapter
 from jmap_eas.backend.sync import SyncCoordinator
 from jmap_eas.config import PolicyConfig
 from jmap_eas.errors import InvalidArgumentsError
+from jmap_eas.jmap import blob as blob_module
 from jmap_eas.jmap import email
 from jmap_eas.jmap.dispatcher import Environment
-from jmap_eas.models import EmailAddress, EmailRecord
+from jmap_eas.models import EmailAddress, EmailRecord, MailboxRecord
+from jmap_eas.store import blobs as store_blobs
 from jmap_eas.store import cache, db, state
 
 
@@ -32,6 +43,9 @@ class FakeClient:
         self._mime = mime if mime is not None else _mime_bytes()
         self._attachments = attachments or []
         self._fail = fail
+        self.apply_calls: list[tuple] = []
+        self.draft_calls: list[tuple] = []
+        self.move_calls: list[tuple] = []
 
     def provision(self):
         return "policy-key"
@@ -50,6 +64,33 @@ class FakeClient:
 
     def fetch_attachment(self, file_reference):
         raise NotImplementedError
+
+    def create_folder(self, *a, **k):
+        raise NotImplementedError
+
+    def update_folder(self, *a, **k):
+        raise NotImplementedError
+
+    def delete_folder(self, *a, **k):
+        raise NotImplementedError
+
+    def apply_email_changes(self, folder_id, sync_key, changes, *, deletes_as_moves=True):
+        self.apply_calls.append((folder_id, sync_key, list(changes), deletes_as_moves))
+        if self._fail:
+            raise StatusError("Sync", "12")
+        return EmailChangesResult(sync_key="new-key", statuses={c.server_id: "1" for c in changes})
+
+    def create_email_draft(self, folder_id, sync_key, message, *, read=False, flagged=False, client_id=None):
+        self.draft_calls.append((folder_id, sync_key, message, read, flagged, client_id))
+        if self._fail:
+            raise StatusError("Sync", "12")
+        return EmailAddResult(sync_key="new-key", client_id=client_id or "cid", status="1", server_id="9:new")
+
+    def move_item(self, item_id, src_folder_id, dst_folder_id):
+        self.move_calls.append((item_id, src_folder_id, dst_folder_id))
+        if self._fail:
+            raise StatusError("MoveItems", "1")
+        return "10:new"
 
     def close(self):
         pass
@@ -75,6 +116,16 @@ def _seed(database, **overrides) -> EmailRecord:
     with database.transaction() as conn:
         cache.upsert_email(conn, record)
         state.append_change(conn, "alice", "Email", record.email_id, "created")
+    return record
+
+
+def _seed_mailbox(database, **overrides) -> MailboxRecord:
+    defaults = dict(account_id="alice", mailbox_id="1", parent_id="0", name="Inbox",
+                     folder_type=int(FolderType.INBOX), sync_key="5")
+    defaults.update(overrides)
+    record = MailboxRecord(**defaults)
+    with database.transaction() as conn:
+        cache.upsert_mailbox(conn, record)
     return record
 
 
@@ -292,3 +343,291 @@ def test_changes_requires_since_state(tmp_path):
     env, database = _env(tmp_path)
     with pytest.raises(InvalidArgumentsError):
         email.changes(env, {})
+
+
+# -- set: create (drafts only) -------------------------------------------------------
+
+
+def test_set_create_draft_success(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS), sync_key="7")
+
+    result = email.set_(env, {
+        "create": {
+            "c1": {
+                "mailboxIds": {"3": True},
+                "keywords": {"$draft": True},
+                "subject": "Hi",
+                "from": [{"email": "me@example.com", "name": "Me"}],
+                "to": [{"email": "you@example.com"}],
+                "bodyValues": {"b": {"value": "hello"}},
+                "textBody": [{"partId": "b", "type": "text/plain"}],
+            }
+        }
+    })
+
+    assert result["notCreated"] == {}
+    email_id = result["created"]["c1"]["id"]
+    stored = cache.get_email(database.conn, "alice", email_id)
+    assert stored.subject == "Hi"
+    assert stored.mailbox_id == "3"
+    folder_id, sync_key, message, read, flagged, client_id = client.draft_calls[0]
+    assert folder_id == "3"
+    assert sync_key == "7"
+    assert message["Subject"] == "Hi"
+    assert message["To"] == "you@example.com"
+    assert 1 <= len(client_id) <= 40
+
+
+def test_set_create_rejects_non_drafts_mailbox(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1", folder_type=int(FolderType.INBOX))
+    result = email.set_(env, {
+        "create": {"c1": {"mailboxIds": {"1": True}, "keywords": {"$draft": True}, "subject": "Hi"}}
+    })
+    assert result["notCreated"]["c1"]["type"] == "invalidProperties"
+    assert result["notCreated"]["c1"]["properties"] == ["mailboxIds"]
+
+
+def test_set_create_rejects_multiple_mailboxes(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    _seed_mailbox(database, mailbox_id="1", folder_type=int(FolderType.INBOX))
+    result = email.set_(env, {
+        "create": {"c1": {"mailboxIds": {"3": True, "1": True}, "keywords": {"$draft": True}}}
+    })
+    assert result["notCreated"]["c1"]["type"] == "invalidProperties"
+
+
+def test_set_create_requires_draft_keyword(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    result = email.set_(env, {"create": {"c1": {"mailboxIds": {"3": True}, "subject": "Hi"}}})
+    assert result["notCreated"]["c1"]["type"] == "invalidProperties"
+    assert result["notCreated"]["c1"]["properties"] == ["keywords"]
+
+
+def test_set_create_rejects_unsupported_keyword(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    result = email.set_(env, {
+        "create": {"c1": {"mailboxIds": {"3": True}, "keywords": {"$draft": True, "$important": True}}}
+    })
+    assert result["notCreated"]["c1"]["type"] == "invalidProperties"
+
+
+def test_set_create_sets_read_and_flagged_from_keywords(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    email.set_(env, {
+        "create": {"c1": {"mailboxIds": {"3": True}, "keywords": {"$draft": True, "$seen": True, "$flagged": True}}}
+    })
+    _, _, _, read, flagged, _ = client.draft_calls[0]
+    assert read is True
+    assert flagged is True
+
+
+def test_set_create_backend_failure(tmp_path):
+    client = FakeClient(fail=True)
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    result = email.set_(env, {"create": {"c1": {"mailboxIds": {"3": True}, "keywords": {"$draft": True}}}})
+    assert result["notCreated"]["c1"]["type"] == "serverFail"
+
+
+def test_set_create_attachment_from_uploaded_blob(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    with database.transaction() as conn:
+        store_blobs.insert_blob(conn, "alice", "u1", "text/plain", b"file contents")
+    blob_id = blob_module.encode_upload_blob_id("u1")
+
+    result = email.set_(env, {
+        "create": {"c1": {
+            "mailboxIds": {"3": True}, "keywords": {"$draft": True},
+            "attachments": [{"blobId": blob_id, "name": "notes.txt", "type": "text/plain"}],
+        }}
+    })
+    assert result["notCreated"] == {}
+    message = client.draft_calls[0][2]
+    attachments = list(message.iter_attachments())
+    assert len(attachments) == 1
+    assert attachments[0].get_content() == "file contents"  # text/plain: decoded to str, not raw bytes
+    assert attachments[0].get_filename() == "notes.txt"
+
+
+def test_set_create_rejects_unresolvable_attachment_blob(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="3", folder_type=int(FolderType.DRAFTS))
+    result = email.set_(env, {
+        "create": {"c1": {
+            "mailboxIds": {"3": True}, "keywords": {"$draft": True},
+            "attachments": [{"blobId": "not-a-real-blob-id"}],
+        }}
+    })
+    assert result["notCreated"]["c1"]["type"] == "invalidProperties"
+
+
+# -- set: update (keywords, move) ------------------------------------------------------
+
+
+def test_set_update_keywords_full_replace(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1", sync_key="5")
+    _seed(database, mailbox_id="1", server_id="9:1", seen=False, flagged=False)
+
+    result = email.set_(env, {"update": {"e1": {"keywords": {"$seen": True}}}})
+
+    assert result["updated"] == {"e1": None}
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.seen is True
+    assert stored.flagged is False
+    assert client.apply_calls[0][0] == "1"
+
+
+def test_set_update_keywords_patch_path(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1", sync_key="5")
+    _seed(database, mailbox_id="1", server_id="9:1", seen=False, flagged=False)
+
+    email.set_(env, {"update": {"e1": {"keywords/$flagged": True}}})
+
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.flagged is True
+    assert stored.seen is False  # untouched
+
+
+def test_set_update_rejects_unsupported_keyword(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed(database, mailbox_id="1", server_id="9:1")
+    result = email.set_(env, {"update": {"e1": {"keywords": {"$important": True}}}})
+    assert result["notUpdated"]["e1"]["type"] == "invalidProperties"
+
+
+def test_set_update_rejects_unsupported_property(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed(database, mailbox_id="1", server_id="9:1")
+    result = email.set_(env, {"update": {"e1": {"subject": "New subject"}}})
+    assert result["notUpdated"]["e1"]["type"] == "invalidProperties"
+    assert result["notUpdated"]["e1"]["properties"] == ["subject"]
+
+
+def test_set_update_not_found(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    result = email.set_(env, {"update": {"missing": {"keywords": {"$seen": True}}}})
+    assert result["notUpdated"]["missing"]["type"] == "notFound"
+
+
+def test_set_update_move_success(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed_mailbox(database, mailbox_id="2", name="Archive")
+    _seed(database, mailbox_id="1", server_id="9:1")
+
+    result = email.set_(env, {"update": {"e1": {"mailboxIds": {"2": True}}}})
+
+    assert result["updated"] == {"e1": None}
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.mailbox_id == "2"
+    assert client.move_calls == [("9:1", "1", "2")]
+
+
+def test_set_update_move_forbidden_when_policy_disallows(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    env.policy.allow_moves = False
+    _seed_mailbox(database, mailbox_id="1")
+    _seed_mailbox(database, mailbox_id="2")
+    _seed(database, mailbox_id="1", server_id="9:1")
+
+    result = email.set_(env, {"update": {"e1": {"mailboxIds": {"2": True}}}})
+
+    assert result["notUpdated"]["e1"]["type"] == "forbidden"
+    assert client.move_calls == []
+
+
+def test_set_update_move_to_unknown_mailbox_rejected(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed(database, mailbox_id="1", server_id="9:1")
+    result = email.set_(env, {"update": {"e1": {"mailboxIds": {"missing": True}}}})
+    assert result["notUpdated"]["e1"]["type"] == "invalidProperties"
+
+
+def test_set_update_multiple_mailboxes_rejected(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed_mailbox(database, mailbox_id="2")
+    _seed(database, mailbox_id="1", server_id="9:1")
+    result = email.set_(env, {"update": {"e1": {"mailboxIds": {"1": True, "2": True}}}})
+    assert result["notUpdated"]["e1"]["type"] == "invalidProperties"
+
+
+# -- set: destroy ------------------------------------------------------------------------
+
+
+def test_set_destroy_success(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1", sync_key="5")
+    _seed(database, mailbox_id="1", server_id="9:1")
+
+    result = email.set_(env, {"destroy": ["e1"]})
+
+    assert result["destroyed"] == ["e1"]
+    assert cache.get_email(database.conn, "alice", "e1") is None
+    assert client.apply_calls[0][3] is True  # deletes_as_moves
+
+
+def test_set_destroy_forbidden_when_policy_disallows(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    env.policy.allow_delete = False
+    _seed_mailbox(database, mailbox_id="1")
+    _seed(database, mailbox_id="1", server_id="9:1")
+
+    result = email.set_(env, {"destroy": ["e1"]})
+
+    assert result["notDestroyed"]["e1"]["type"] == "forbidden"
+    assert cache.get_email(database.conn, "alice", "e1") is not None
+
+
+def test_set_destroy_not_found(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    result = email.set_(env, {"destroy": ["missing"]})
+    assert result["notDestroyed"]["missing"]["type"] == "notFound"
+
+
+def test_set_destroy_backend_failure(tmp_path):
+    client = FakeClient(fail=True)
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1")
+    _seed(database, mailbox_id="1", server_id="9:1")
+    result = email.set_(env, {"destroy": ["e1"]})
+    assert result["notDestroyed"]["e1"]["type"] == "serverFail"
+
+
+def test_set_rejects_malformed_top_level_arguments(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    with pytest.raises(InvalidArgumentsError):
+        email.set_(env, {"destroy": "not-a-list"})

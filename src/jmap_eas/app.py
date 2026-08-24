@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from .jmap import blob as jmap_blob
 from .jmap import session as jmap_session
 from .jmap.dispatcher import Dispatcher, Environment, Invocation
 from .registry import AccountContext, AccountRegistry
+from .store import blobs as store_blobs
 from .store import db as store_db
 from .store.db import Database
 
@@ -147,9 +149,12 @@ async def api(request: Request) -> Response:
     })
 
 
-def _fetch_blob(context: AccountContext, locator: jmap_blob.BlobLocator) -> tuple[bytes, str]:
+def _resolve_blob(
+    state: AppState, context: AccountContext, account_id: str, locator: jmap_blob.BlobLocator
+) -> tuple[bytes, str] | None:
     with context.command_lock:
-        return jmap_blob.fetch_blob(locator, context.command)
+        return jmap_blob.resolve_blob(locator, account_id=account_id, adapter=context.command,
+                                       database=state.database)
 
 
 async def download(request: Request) -> Response:
@@ -167,8 +172,40 @@ async def download(request: Request) -> Response:
         return JSONResponse({"type": "notFound"}, status_code=404)
 
     context = state.registry.get(account_id)
-    data, content_type = await run_in_threadpool(_fetch_blob, context, locator)
+    resolved = await run_in_threadpool(_resolve_blob, state, context, account_id, locator)
+    if resolved is None:
+        return JSONResponse({"type": "notFound"}, status_code=404)
+    data, content_type = resolved
     return Response(data, media_type=content_type)
+
+
+def _store_upload(state: AppState, account_id: str, upload_id: str, content_type: str, data: bytes) -> None:
+    with state.database.transaction() as conn:
+        store_blobs.insert_blob(conn, account_id, upload_id, content_type, data)
+
+
+async def upload(request: Request) -> Response:
+    """RFC 8620 section 6.1: `POST /upload/{accountId}`."""
+    state: AppState = request.app.state.jmap_eas
+    account_id = _authenticate(request)
+    if account_id is None:
+        return _unauthorized()
+    if request.path_params["account_id"] != account_id:
+        return JSONResponse({"type": "accountNotFound"}, status_code=404)
+
+    data = await request.body()
+    if len(data) > policy.MAX_UPLOAD_SIZE_BYTES:
+        return JSONResponse({"type": "requestTooLarge"}, status_code=413)
+    content_type = request.headers.get("content-type") or "application/octet-stream"
+
+    upload_id = secrets.token_urlsafe(16)
+    await run_in_threadpool(_store_upload, state, account_id, upload_id, content_type, data)
+    return JSONResponse({
+        "accountId": account_id,
+        "blobId": jmap_blob.encode_upload_blob_id(upload_id),
+        "type": content_type,
+        "size": len(data),
+    })
 
 
 def create_app(config: AppConfig | None = None) -> Starlette:
@@ -183,6 +220,7 @@ def create_app(config: AppConfig | None = None) -> Starlette:
         Route("/.well-known/jmap", well_known_jmap),
         Route("/api", api, methods=["POST"]),
         Route("/download/{account_id}/{blob_id}/{name}", download),
+        Route("/upload/{account_id}", upload, methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=_lifespan)
     app.state.jmap_eas = _build_state(config)

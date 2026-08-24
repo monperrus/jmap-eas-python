@@ -22,8 +22,23 @@ mailboxIds, threadId) come straight from that cache; `size`, `preview`,
 live `ItemOperations` fetch and are only fetched when actually requested.
 `bcc`, `sender`, `sentAt`, `inReplyTo`, `references`, `messageId`, and
 `bodyStructure` aren't derivable from what `pyactivesync`'s `Sync`/`Fetch`
-expose today and are always returned `null`. Nothing mutates yet — every
-`*/set` method and `EmailSubmission` are M2/M3.
+expose today and are always returned `null`.
+
+M2, mutations, is also implemented: `Mailbox/set` (create/rename/reparent/
+delete, cascading a folder delete to its cached emails), `Email/set` for
+read/flagged keyword changes (`$seen`/`$flagged` only -- any other keyword is
+rejected per object, not silently dropped), single-mailbox move, delete, and
+draft creation (`mailboxIds` must resolve to exactly one Drafts-role mailbox
+and `keywords` must include `$draft: true` -- EAS's `Sync Add` only accepts
+drafts), and `POST /upload/{accountId}` for attachment blobs referenced from
+a draft. `Email/import` and `Email/copy` are intentionally unregistered, not
+stubbed: EAS 16.1 has no arbitrary-folder item creation to implement them
+with. Moves and deletes are further gated by `policy.allow_moves`/
+`allow_delete` (forbidden per object when disabled, not method-wide, since
+e.g. keyword updates must stay available either way); `Email/set` create/
+update always commits EAS's returned SyncKey even when the per-item status
+isn't `"1"`, so a rejected mutation never desyncs the folder. `EmailSubmission`
+is M3.
 
 A folder sync caches at most 10 pages (1000 items) per request
 (`SyncCoordinator.DEFAULT_MAX_PAGES_PER_CALL`) so one JMAP request can never
