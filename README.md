@@ -93,6 +93,17 @@ live against a real Exchange mailbox with 1000+ messages per folder,
 including empty folders (a real-world empty-`Sync`-response-body bug this
 uncovered was fixed upstream in `pyactivesync`).
 
+M5 replaces the ad hoc verification scripts used for M1-M4 with a
+committed, reusable live-test suite (`tests/integration/live/`, see "Live
+tests" below): 20 pytest tests exercising the full bridge -- read, mutate,
+send, and push -- through the real ASGI app against a real EAS account.
+Every fixture that creates account state cleans it up in a `finally`, even
+on test failure, and a session-scoped autouse fixture snapshots the
+account's mailboxes before the run and asserts nothing new is left behind
+after -- a live test run that's interrupted before this session existed once
+left an orphaned folder in the account, caught only by a duplicate-name
+failure on the next run.
+
 ## Configuration
 
 The bridge reads a TOML file named by the `JMAP_EAS_CONFIG` environment
@@ -147,9 +158,11 @@ adjacent editable checkout rather than PyPI.
 
 ### Live tests
 
-`tests/integration/test_eas_adapter_live.py` exercises `EasAdapter` and
-`AccountRegistry` against a real EAS server. It skips automatically unless
-these environment variables are set (never commit real values):
+`tests/integration/live/` exercises the bridge against a real EAS server --
+`EasAdapter`/`AccountRegistry` directly, and the rest of the suite through
+the full ASGI app via `TestClient`. Every test in this directory skips
+automatically unless these environment variables are set (never commit real
+values):
 
 ```bash
 export JMAP_EAS_LIVE_SERVER=...
@@ -157,7 +170,13 @@ export JMAP_EAS_LIVE_USER=...        # e.g. a domain\user login
 export JMAP_EAS_LIVE_SMTP_USER=...   # optional, defaults to JMAP_EAS_LIVE_USER
 export JMAP_EAS_LIVE_DEVICE_ID=...
 export JMAP_EAS_LIVE_PASSWORD=...
-pytest tests/integration/test_eas_adapter_live.py
+pytest tests/integration/live/
 ```
 
-It only calls read-only commands (`Provision`, `FolderSync`).
+Coverage: read (`Mailbox`/`Email`/`Thread get`/`query`/`changes`), mutations
+(`Mailbox/set`, `Email/set` keywords/move/destroy -- confined to a mailbox
+and drafts the run creates itself), send (`EmailSubmission/set` -- always
+addressed to the configured account's own address, never a third party),
+and push (`GET /eventsource`, `Mailbox/Email queryChanges`). Nothing here
+ever destroys an id it didn't create itself in that test run; a
+session-scoped fixture asserts no mailbox is left behind afterward.
