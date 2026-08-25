@@ -29,6 +29,9 @@ class AccountContext:
         # Folder mutations additionally take per-folder locks (not held here)
         # because they consume and replace that folder's SyncKey.
         self.command_lock = threading.Lock()
+        # Serializes concurrent EventSource connections' use of the Ping adapter;
+        # independent of command_lock so a long Ping never blocks ordinary JMAP calls.
+        self.ping_lock = threading.Lock()
 
     def close(self) -> None:
         self.command.close()

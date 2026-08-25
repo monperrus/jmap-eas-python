@@ -24,6 +24,7 @@ from pyactivesync.models import (
     FetchedItem,
     Folder,
     FolderType,
+    PingResult,
     SyncResult,
 )
 
@@ -66,6 +67,11 @@ class EasClientProtocol(Protocol):
     def move_item(self, item_id: str, src_folder_id: str, dst_folder_id: str) -> str: ...
 
     def send_mail(self, message: Message, *, save_in_sent_items: bool = True, client_id: str | None = None) -> None: ...
+
+    def ping(
+        self, folder_ids: Iterable[str], *, folder_class: str = "Email", heartbeat: int = 60,
+        timeout: float | None = None,
+    ) -> PingResult: ...
 
     def close(self) -> None: ...
 
@@ -169,6 +175,15 @@ class EasAdapter:
         server already accepted the message is indistinguishable from one before, from here."""
         try:
             self._client.send_mail(message, save_in_sent_items=save_in_sent_items, client_id=client_id)
+        except Exception as exc:
+            raise map_eas_exception(exc) from exc
+
+    def ping(
+        self, folder_ids: Iterable[str], *, folder_class: str = "Email", heartbeat: int = 60,
+        timeout: float | None = None,
+    ) -> PingResult:
+        try:
+            return self._client.ping(folder_ids, folder_class=folder_class, heartbeat=heartbeat, timeout=timeout)
         except Exception as exc:
             raise map_eas_exception(exc) from exc
 

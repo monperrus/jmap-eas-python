@@ -58,7 +58,17 @@ capability (and `Identity/get`'s reason for existing) from that account's
 `accountCapabilities` in the session resource, since submission has no other
 purpose a disabled account would still need.
 
-M4 is in progress: `Mailbox/queryChanges` and `Email/queryChanges` use a
+M4, push and conformance polish, is implemented. `GET /eventsource`
+(RFC 8620 section 7.3) is a Server-Sent-Events stream backed by EAS `Ping`:
+each cycle blocks the account's dedicated Ping connection (never the command
+one `POST /api` uses) for up to a minute in a worker thread, and a changed
+folder triggers a targeted `sync_folder()` before an `event: state` frame is
+emitted with only the JMAP types whose state actually changed. `types`,
+`closeafter`, and `ping` query parameters are all supported; a client
+disconnect is only noticed between Ping cycles, since a blocking long poll
+already in flight can't be cancelled from here.
+
+`Mailbox/queryChanges` and `Email/queryChanges` use a
 conservative diff over the plain change log rather than tracking sort
 positions -- an object that was destroyed, or created/updated at all
 (whether or not it currently matches the query), is reported `removed`;

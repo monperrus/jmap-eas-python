@@ -1,6 +1,7 @@
 """ASGI application and lifecycle for the JMAP-over-EAS bridge."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -14,7 +15,7 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from . import __version__, policy
@@ -23,6 +24,7 @@ from .backend.sync import SyncCoordinator
 from .config import AppConfig, load_config
 from .errors import JmapError
 from .jmap import blob as jmap_blob
+from .jmap import eventsource as jmap_eventsource
 from .jmap import session as jmap_session
 from .jmap.dispatcher import Dispatcher, Environment, Invocation
 from .observability import Metrics, configure_logging, get_logger
@@ -30,6 +32,9 @@ from .registry import AccountContext, AccountRegistry
 from .store import blobs as store_blobs
 from .store import db as store_db
 from .store.db import Database
+
+EVENTSOURCE_IDLE_POLL_SECONDS = 5
+EVENTSOURCE_ERROR_BACKOFF_SECONDS = 5
 
 CONFIG_ENV_VAR = "JMAP_EAS_CONFIG"
 
@@ -253,6 +258,65 @@ async def upload(request: Request) -> Response:
     })
 
 
+async def _eventsource_stream(
+    request: Request, state: AppState, context: AccountContext, account_id: str,
+    params: jmap_eventsource.EventSourceParams,
+) -> AsyncGenerator[str]:
+    last_states = await run_in_threadpool(jmap_eventsource.current_states, state.database, account_id, params.types)
+    yield jmap_eventsource.format_state_event(account_id, last_states)
+    if params.close_after_state:
+        return
+
+    last_ping_sent = time.monotonic()
+    while True:
+        if await request.is_disconnected():
+            return
+        try:
+            folder_ids = await run_in_threadpool(jmap_eventsource.mail_folder_ids, state.database, account_id)
+            if not folder_ids:
+                await asyncio.sleep(EVENTSOURCE_IDLE_POLL_SECONDS)
+            else:
+                # Blocks the worker thread for up to ~heartbeat seconds (a real EAS long poll);
+                # a client disconnect during that window is only noticed on the next iteration.
+                changed_folders = await run_in_threadpool(
+                    jmap_eventsource.ping_and_sync, state.sync, context, account_id, folder_ids
+                )
+                if changed_folders:
+                    new_states = await run_in_threadpool(
+                        jmap_eventsource.current_states, state.database, account_id, params.types
+                    )
+                    delta = {t: v for t, v in new_states.items() if last_states.get(t) != v}
+                    if delta:
+                        last_states.update(delta)
+                        yield jmap_eventsource.format_state_event(account_id, delta)
+                        if params.close_after_state:
+                            return
+        except JmapError as exc:
+            _logger.warning("eventsource ping/sync failed", extra={"fields": {
+                "account_id": account_id, "error_type": exc.type,
+            }})
+            await asyncio.sleep(EVENTSOURCE_ERROR_BACKOFF_SECONDS)
+
+        if params.ping_interval and time.monotonic() - last_ping_sent >= params.ping_interval:
+            yield jmap_eventsource.format_ping_event(params.ping_interval)
+            last_ping_sent = time.monotonic()
+
+
+async def eventsource(request: Request) -> Response:
+    """RFC 8620 section 7.3: `GET /eventsource`, an SSE push stream backed by EAS `Ping`."""
+    state: AppState = request.app.state.jmap_eas
+    account_id = _authenticate(request)
+    if account_id is None:
+        return _unauthorized()
+    params = jmap_eventsource.parse_params(dict(request.query_params))
+    context = state.registry.get(account_id)
+    return StreamingResponse(
+        _eventsource_stream(request, state, context, account_id, params),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def create_app(config: AppConfig | None = None) -> Starlette:
     """Build the ASGI application. `config` defaults to loading the file named by `JMAP_EAS_CONFIG`."""
     if config is None:
@@ -266,6 +330,7 @@ def create_app(config: AppConfig | None = None) -> Starlette:
         Route("/api", api, methods=["POST"]),
         Route("/download/{account_id}/{blob_id}/{name}", download),
         Route("/upload/{account_id}", upload, methods=["POST"]),
+        Route("/eventsource", eventsource),
     ]
     app = Starlette(routes=routes, lifespan=_lifespan)
     app.state.jmap_eas = _build_state(config)

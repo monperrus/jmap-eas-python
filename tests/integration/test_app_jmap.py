@@ -73,6 +73,10 @@ class FakeClient:
     def send_mail(self, message, *, save_in_sent_items=True, client_id=None):
         self.sent_mail.append((message, client_id))
 
+    def ping(self, folder_ids, *, folder_class="Email", heartbeat=60, timeout=None):
+        from pyactivesync.models import PingResult
+        return PingResult(status="2", changed_folder_ids=[])
+
     def close(self):
         pass
 
@@ -564,3 +568,38 @@ def test_email_submission_set_forbidden_by_policy(tmp_path):
 
         session = client.get("/.well-known/jmap", headers=_basic("alice", "bridge-token"))
         assert "urn:ietf:params:jmap:submission" not in session.json()["accounts"]["alice"]["accountCapabilities"]
+
+
+# -- eventsource --------------------------------------------------------------------------
+
+
+def test_eventsource_requires_auth(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.get("/eventsource")
+        assert response.status_code == 401
+
+
+def test_eventsource_closeafter_state_sends_one_event_and_closes(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.get(
+            "/eventsource?closeafter=state", headers=_basic("alice", "bridge-token")
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "event: state" in response.text
+        assert '"@type": "StateChange"' in response.text
+        assert '"alice"' in response.text
+
+
+def test_eventsource_closeafter_state_respects_types_filter(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.get(
+            "/eventsource?closeafter=state&types=Mailbox", headers=_basic("alice", "bridge-token")
+        )
+        payload = response.text.split("data: ", 1)[1]
+        import json
+        changed = json.loads(payload)["changed"]["alice"]
+        assert set(changed) == {"Mailbox"}

@@ -96,6 +96,12 @@ class FakeClient:
         if self.fail:
             raise StatusError("SendMail", "6")
 
+    def ping(self, folder_ids, *, folder_class="Email", heartbeat=60, timeout=None):
+        if self.fail:
+            raise StatusError("Ping", "2")
+        from pyactivesync.models import PingResult
+        return PingResult(status="2", changed_folder_ids=list(folder_ids))
+
     def close(self) -> None:
         self.closed = True
 
@@ -268,6 +274,18 @@ def test_send_mail_maps_eas_exception():
     adapter = EasAdapter(FakeClient(fail=True))
     with pytest.raises(BackendError):
         adapter.send_mail(EmailMessage())
+
+
+def test_ping_returns_result():
+    adapter = EasAdapter(FakeClient())
+    result = adapter.ping(["1", "2"])
+    assert result.changed_folder_ids == ["1", "2"]
+
+
+def test_ping_maps_eas_exception():
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.ping(["1"])
 
 
 def test_close_closes_underlying_client():
