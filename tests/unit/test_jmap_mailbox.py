@@ -348,3 +348,80 @@ def test_set_state_transitions(tmp_path):
     result = mailbox.set_(env, {"create": {"c1": {"name": "New"}}})
     assert result["oldState"] == old_state
     assert result["newState"] != old_state
+
+
+# -- query: canCalculateChanges + queryChanges ---------------------------------------------
+
+
+def test_query_reports_can_calculate_changes(tmp_path):
+    env, database = _env(tmp_path)
+    _seed_mailboxes(database)
+    result = mailbox.query(env, {})
+    assert result["canCalculateChanges"] is True
+
+
+def test_query_changes_requires_since_query_state(tmp_path):
+    env, database = _env(tmp_path)
+    with pytest.raises(InvalidArgumentsError):
+        mailbox.query_changes(env, {})
+
+
+def test_query_changes_raises_cannot_calculate_for_future_state(tmp_path):
+    env, database = _env(tmp_path)
+    _seed_mailboxes(database)
+    with pytest.raises(CannotCalculateChangesError):
+        mailbox.query_changes(env, {"sinceQueryState": "999"})
+
+
+def test_query_changes_reports_created_as_added(tmp_path):
+    client = FakeFolderClient(new_folder_id="new1")
+    env, database = _env(tmp_path, client=client)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Mailbox")
+    mailbox.set_(env, {"create": {"c1": {"name": "AAA New"}}})  # sorts first alphabetically
+
+    result = mailbox.query_changes(env, {"sinceQueryState": old_state})
+
+    assert result["removed"] == ["new1"]  # conservative: also reported removed
+    assert result["added"] == [{"id": "new1", "index": 0}]
+    assert result["oldQueryState"] == old_state
+    assert result["newQueryState"] != old_state
+
+
+def test_query_changes_reports_destroyed_as_removed(tmp_path):
+    client = FakeFolderClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailboxes(database)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Mailbox")
+    mailbox.set_(env, {"destroy": ["2"]})
+
+    result = mailbox.query_changes(env, {"sinceQueryState": old_state})
+
+    assert result["removed"] == ["2"]
+    assert result["added"] == []
+
+
+def test_query_changes_respects_filter(tmp_path):
+    client = FakeFolderClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailboxes(database)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Mailbox")
+    mailbox.set_(env, {"update": {"1": {"name": "Renamed Inbox"}}})
+
+    # Filtered to a role the renamed mailbox doesn't have: it's removed but never re-added.
+    result = mailbox.query_changes(env, {"sinceQueryState": old_state, "filter": {"role": "drafts"}})
+    assert result["removed"] == ["1"]
+    assert result["added"] == []
+
+
+def test_query_changes_calculate_total(tmp_path):
+    client = FakeFolderClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailboxes(database)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Mailbox")
+    mailbox.set_(env, {"update": {"1": {"name": "Renamed"}}})
+    result = mailbox.query_changes(env, {"sinceQueryState": old_state, "calculateTotal": True})
+    assert result["total"] == 2

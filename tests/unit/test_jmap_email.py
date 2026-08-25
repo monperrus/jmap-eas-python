@@ -17,7 +17,7 @@ from pyactivesync.models import (
 from jmap_eas.backend.eas import EasAdapter
 from jmap_eas.backend.sync import SyncCoordinator
 from jmap_eas.config import PolicyConfig
-from jmap_eas.errors import InvalidArgumentsError
+from jmap_eas.errors import CannotCalculateChangesError, InvalidArgumentsError
 from jmap_eas.jmap import blob as blob_module
 from jmap_eas.jmap import email
 from jmap_eas.jmap.dispatcher import Environment
@@ -631,3 +631,73 @@ def test_set_rejects_malformed_top_level_arguments(tmp_path):
     env, database = _env(tmp_path, client=client)
     with pytest.raises(InvalidArgumentsError):
         email.set_(env, {"destroy": "not-a-list"})
+
+
+# -- query: canCalculateChanges + queryChanges -----------------------------------------------
+
+
+def test_query_reports_can_calculate_changes(tmp_path):
+    env, database = _env(tmp_path)
+    result = email.query(env, {})
+    assert result["canCalculateChanges"] is True
+
+
+def test_query_changes_requires_since_query_state(tmp_path):
+    env, database = _env(tmp_path)
+    with pytest.raises(InvalidArgumentsError):
+        email.query_changes(env, {})
+
+
+def test_query_changes_raises_cannot_calculate_for_future_state(tmp_path):
+    env, database = _env(tmp_path)
+    with pytest.raises(CannotCalculateChangesError):
+        email.query_changes(env, {"sinceQueryState": "999"})
+
+
+def test_query_changes_reports_created_matching_filter_as_added(tmp_path):
+    env, database = _env(tmp_path)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Email")
+    _seed(database, email_id="e1", mailbox_id="1", subject="Report")
+
+    result = email.query_changes(env, {"sinceQueryState": old_state, "filter": {"subject": "report"}})
+
+    assert result["removed"] == ["e1"]  # conservative
+    assert result["added"] == [{"id": "e1", "index": 0}]
+
+
+def test_query_changes_created_not_matching_filter_is_removed_only(tmp_path):
+    env, database = _env(tmp_path)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Email")
+    _seed(database, email_id="e1", mailbox_id="1", subject="Lunch")
+
+    result = email.query_changes(env, {"sinceQueryState": old_state, "filter": {"subject": "report"}})
+
+    assert result["removed"] == ["e1"]
+    assert result["added"] == []
+
+
+def test_query_changes_reports_destroyed_as_removed(tmp_path):
+    client = FakeClient()
+    env, database = _env(tmp_path, client=client)
+    _seed_mailbox(database, mailbox_id="1", sync_key="5")
+    _seed(database, email_id="e1", mailbox_id="1", server_id="9:1")
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Email")
+
+    email.set_(env, {"destroy": ["e1"]})
+    result = email.query_changes(env, {"sinceQueryState": old_state})
+
+    assert result["removed"] == ["e1"]
+    assert result["added"] == []
+
+
+def test_query_changes_calculate_total(tmp_path):
+    env, database = _env(tmp_path)
+    with database.transaction() as conn:
+        old_state = state.current_state(conn, "alice", "Email")
+    _seed(database, email_id="e1")
+    _seed(database, email_id="e2", server_id="9:2")
+    result = email.query_changes(env, {"sinceQueryState": old_state, "calculateTotal": True})
+    assert result["total"] == 2

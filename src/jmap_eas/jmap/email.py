@@ -32,7 +32,7 @@ from ..models import EmailAddress, EmailRecord
 from ..store import cache, state
 from . import blob
 from .dispatcher import Environment
-from .filtering import evaluate_filter
+from .filtering import compute_query_changes, evaluate_filter
 
 CHEAP_PROPERTIES = [
     "id", "blobId", "mailboxIds", "threadId", "subject", "from", "to", "cc", "replyTo", "receivedAt", "keywords",
@@ -271,7 +271,7 @@ def query(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "accountId": env.account_id,
         "queryState": current,
-        "canCalculateChanges": False,
+        "canCalculateChanges": True,
         "position": position,
         "ids": [r.email_id for r in window],
     }
@@ -279,6 +279,35 @@ def query(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
         result["limit"] = limit
     if calculate_total:
         result["total"] = total
+    return result
+
+
+def query_changes(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
+    since_query_state = arguments.get("sinceQueryState")
+    if not isinstance(since_query_state, str):
+        raise InvalidArgumentsError("sinceQueryState is required")
+    max_changes = arguments.get("maxChanges")
+    calculate_total = bool(arguments.get("calculateTotal"))
+
+    with env.database.transaction() as conn:
+        try:
+            diff = state.get_changes(conn, env.account_id, "Email", since_query_state, max_changes)
+        except state.CannotCalculateChangesError as exc:
+            raise CannotCalculateChangesError(str(exc)) from exc
+
+    full = query(env, {
+        "filter": arguments.get("filter"), "sort": arguments.get("sort"), "calculateTotal": calculate_total,
+    })
+    removed, added = compute_query_changes(diff.created, diff.updated, diff.destroyed, full["ids"])
+    result: dict[str, Any] = {
+        "accountId": env.account_id,
+        "oldQueryState": diff.old_state,
+        "newQueryState": diff.new_state,
+        "removed": removed,
+        "added": added,
+    }
+    if calculate_total:
+        result["total"] = full["total"]
     return result
 
 

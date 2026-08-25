@@ -145,3 +145,60 @@ def test_get_changes_max_changes_keeps_all_rows_for_included_objects(tmp_path):
 
     next_result = state.get_changes(database.conn, "alice", "Email", result.new_state, max_changes=1)
     assert next_result.updated == ["e1"]
+
+
+# -- prune_change_log ------------------------------------------------------------------------
+
+
+def test_prune_change_log_no_op_below_keep_threshold(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        for i in range(5):
+            state.append_change(conn, "alice", "Email", f"e{i}", "created")
+        state.prune_change_log(conn, "alice", keep=100)
+    # Nothing pruned: sinceState="0" still works.
+    result = state.get_changes(database.conn, "alice", "Email", "0")
+    assert len(result.created) == 5
+
+
+def test_prune_change_log_deletes_old_rows_and_records_watermark(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        for i in range(10):
+            state.append_change(conn, "alice", "Email", f"e{i}", "created")
+        state.prune_change_log(conn, "alice", keep=3)
+
+    rows = database.execute("SELECT COUNT(*) FROM change_log WHERE account_id = 'alice'").fetchone()[0]
+    assert rows == 3
+
+    # A sinceState older than the prune point can no longer be answered correctly.
+    with pytest.raises(state.CannotCalculateChangesError):
+        state.get_changes(database.conn, "alice", "Email", "0")
+
+    # But the retained tail still works.
+    result = state.get_changes(database.conn, "alice", "Email", "7")
+    assert result.created == ["e7", "e8", "e9"]
+
+
+def test_prune_change_log_is_per_account(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        for i in range(10):
+            state.append_change(conn, "alice", "Email", f"e{i}", "created")
+            state.append_change(conn, "bob", "Email", f"e{i}", "created")
+        state.prune_change_log(conn, "alice", keep=3)
+
+    # bob's history is untouched.
+    result = state.get_changes(database.conn, "bob", "Email", "0")
+    assert len(result.created) == 10
+
+
+def test_prune_change_log_watermark_persists_across_calls(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        for i in range(10):
+            state.append_change(conn, "alice", "Email", f"e{i}", "created")
+        state.prune_change_log(conn, "alice", keep=5)
+        state.prune_change_log(conn, "alice", keep=100)  # a no-op this time, watermark must not move backward
+    with pytest.raises(state.CannotCalculateChangesError):
+        state.get_changes(database.conn, "alice", "Email", "0")

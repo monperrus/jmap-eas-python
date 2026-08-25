@@ -87,12 +87,14 @@ class SyncCoordinator:
                     break
 
     def sync_account(self, account_id: str, adapter: EasAdapter) -> None:
-        """Reconcile folders, then sync every mailbox's items."""
+        """Reconcile folders, sync every mailbox's items, then prune old change-log history."""
         self.reconcile_folders(account_id, adapter)
         with self._database.transaction() as conn:
             folder_ids = [mailbox.mailbox_id for mailbox in cache.list_mailboxes(conn, account_id)]
         for folder_id in folder_ids:
             self.sync_folder(account_id, folder_id, adapter)
+        with self._database.transaction() as conn:
+            state.prune_change_log(conn, account_id)
 
     def _sync_folder_once(
         self, account_id: str, folder_id: str, adapter: EasAdapter, sync_key: str

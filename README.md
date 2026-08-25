@@ -58,6 +58,23 @@ capability (and `Identity/get`'s reason for existing) from that account's
 `accountCapabilities` in the session resource, since submission has no other
 purpose a disabled account would still need.
 
+M4 is in progress: `Mailbox/queryChanges` and `Email/queryChanges` use a
+conservative diff over the plain change log rather than tracking sort
+positions -- an object that was destroyed, or created/updated at all
+(whether or not it currently matches the query), is reported `removed`;
+one that's created/updated and still matches is reported `added` at its
+current index. This can occasionally report a redundant `removed` for an id
+the client never had, which RFC 8620 explicitly allows (the client just
+ignores it), in exchange for never missing a real change. `POST /api`
+now validates `using` per RFC 8620 section 3.1 (must include the core
+capability; must not name an unrecognized one). The `change_log` table is
+pruned to the most recent 100k entries per account after every sync, with a
+retention watermark so a `sinceState`/`sinceQueryState` older than the
+pruned history correctly raises `cannotCalculateChanges` instead of silently
+under-reporting. Structured (JSON) logging and lightweight in-memory
+request/error/sync-failure counters are wired in; `GET /healthz` includes a
+`metrics` snapshot.
+
 A folder sync caches at most 10 pages (1000 items) per request
 (`SyncCoordinator.DEFAULT_MAX_PAGES_PER_CALL`) so one JMAP request can never
 block for as long as a large mailbox's full initial sync takes; a folder with

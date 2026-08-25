@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -24,6 +25,7 @@ from .errors import JmapError
 from .jmap import blob as jmap_blob
 from .jmap import session as jmap_session
 from .jmap.dispatcher import Dispatcher, Environment, Invocation
+from .observability import Metrics, configure_logging, get_logger
 from .registry import AccountContext, AccountRegistry
 from .store import blobs as store_blobs
 from .store import db as store_db
@@ -31,27 +33,31 @@ from .store.db import Database
 
 CONFIG_ENV_VAR = "JMAP_EAS_CONFIG"
 
+_logger = get_logger("app")
+
 
 class AppState:
     """Resources shared across requests: configuration, EAS registry, database, and dispatcher."""
 
     def __init__(
         self, config: AppConfig, registry: AccountRegistry, database: Database, sync: SyncCoordinator,
-        dispatcher: Dispatcher,
+        dispatcher: Dispatcher, metrics: Metrics,
     ) -> None:
         self.config = config
         self.registry = registry
         self.database = database
         self.sync = sync
         self.dispatcher = dispatcher
+        self.metrics = metrics
 
 
 def _build_state(config: AppConfig) -> AppState:
+    configure_logging()
     database = store_db.connect(config.server.db_path)
     registry = AccountRegistry(config.accounts)
     sync = SyncCoordinator(database)
     dispatcher = Dispatcher(policy.METHODS)
-    return AppState(config, registry, database, sync, dispatcher)
+    return AppState(config, registry, database, sync, dispatcher, Metrics())
 
 
 @asynccontextmanager
@@ -83,7 +89,7 @@ async def healthz(request: Request) -> JSONResponse:
         state.database.execute("SELECT 1")
     except sqlite3.Error:
         return JSONResponse({"status": "error", "version": __version__}, status_code=503)
-    return JSONResponse({"status": "ok", "version": __version__})
+    return JSONResponse({"status": "ok", "version": __version__, "metrics": state.metrics.snapshot()})
 
 
 async def well_known_jmap(request: Request) -> Response:
@@ -111,6 +117,24 @@ def _parse_method_calls(payload: Any) -> list[Invocation] | None:
     return parsed
 
 
+def _check_using(payload: Any) -> str | None:
+    """RFC 8620 section 3.1: validates the request's `using` capability list.
+
+    Returns an error `type` if the request must be rejected, else `None`.
+    Does not check that each *called method* has its capability listed --
+    only that every listed capability is one this deployment recognizes and
+    that the mandatory core capability is present.
+    """
+    using = payload.get("using") if isinstance(payload, dict) else None
+    if not isinstance(using, list) or not all(isinstance(item, str) for item in using):
+        return "notRequest"
+    if policy.CORE_CAPABILITY not in using:
+        return "notRequest"
+    if any(capability not in policy.CAPABILITIES for capability in using):
+        return "unknownCapability"
+    return None
+
+
 def _sync_and_dispatch(
     state: AppState, context: AccountContext, account_id: str, calls: list[Invocation]
 ) -> list[Invocation]:
@@ -118,8 +142,13 @@ def _sync_and_dispatch(
     with context.command_lock:
         try:
             state.sync.sync_account(account_id, context.command)
-        except JmapError:
-            pass  # best-effort freshness; still serve whatever the cache already has
+        except JmapError as exc:
+            # Best-effort freshness; still serve whatever the cache already has. `exc` is
+            # already redacted (BackendError never carries raw backend text) so it's safe to log.
+            state.metrics.increment("sync_failures_total")
+            _logger.warning("sync failed, serving from cache", extra={"fields": {
+                "account_id": account_id, "error_type": exc.type,
+            }})
         account_config = state.config.accounts[account_id]
         env = Environment(
             account_id=account_id, database=state.database, sync=state.sync, adapter=context.command,
@@ -139,12 +168,26 @@ async def api(request: Request) -> Response:
         payload = await request.json()
     except json.JSONDecodeError:
         return JSONResponse({"type": "notJSON"}, status_code=400)
+    using_error = _check_using(payload)
+    if using_error is not None:
+        return JSONResponse({"type": using_error}, status_code=400)
     calls = _parse_method_calls(payload)
     if calls is None:
         return JSONResponse({"type": "notRequest"}, status_code=400)
 
+    state.metrics.increment("requests_total")
+    started = time.monotonic()
     context = state.registry.get(account_id)
     responses = await run_in_threadpool(_sync_and_dispatch, state, context, account_id, calls)
+    error_count = sum(1 for name, _value, _call_id in responses if name == "error")
+    if error_count:
+        state.metrics.increment("errors_total")
+    _logger.info("api request completed", extra={"fields": {
+        "account_id": account_id,
+        "methods": [name for name, _args, _call_id in calls],
+        "duration_ms": round((time.monotonic() - started) * 1000, 1),
+        "error_count": error_count,
+    }})
     return JSONResponse({
         "methodResponses": [list(response) for response in responses],
         "sessionState": "single-account",

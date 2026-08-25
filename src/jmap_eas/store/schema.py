@@ -82,6 +82,12 @@ MIGRATIONS: tuple[str, ...] = (
         PRIMARY KEY (account_id, submission_id)
     );
     """,
+    """
+    CREATE TABLE change_log_retention (
+        account_id TEXT NOT NULL PRIMARY KEY,
+        pruned_through_seq INTEGER NOT NULL DEFAULT 0
+    );
+    """,
 )
 
 

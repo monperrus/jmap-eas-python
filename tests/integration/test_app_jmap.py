@@ -94,6 +94,11 @@ def _basic(username: str, password: str) -> dict[str, str]:
     return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
 
 
+USING = [
+    "urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission",
+]
+
+
 def _app_with_fake_client(tmp_path, client: FakeClient, *, policy: PolicyConfig | None = None):
     config = AppConfig(
         server=ServerConfig(db_path=str(tmp_path / "bridge.sqlite3")), accounts={"alice": _account()},
@@ -132,7 +137,7 @@ def test_well_known_jmap_returns_session_for_authenticated_account(tmp_path):
 def test_api_requires_auth(tmp_path):
     app = _app_with_fake_client(tmp_path, FakeClient())
     with TestClient(app) as client:
-        response = client.post("/api", json={"methodCalls": []})
+        response = client.post("/api", json={"using": USING, "methodCalls": []})
         assert response.status_code == 401
 
 
@@ -142,7 +147,7 @@ def test_api_core_echo(tmp_path):
         response = client.post(
             "/api",
             headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Core/echo", {"hello": "world"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Core/echo", {"hello": "world"}, "c0"]]},
         )
         assert response.status_code == 200
         assert response.json()["methodResponses"] == [["Core/echo", {"hello": "world"}, "c0"]]
@@ -151,8 +156,79 @@ def test_api_core_echo(tmp_path):
 def test_api_malformed_request_returns_400(tmp_path):
     app = _app_with_fake_client(tmp_path, FakeClient())
     with TestClient(app) as client:
-        response = client.post("/api", headers=_basic("alice", "bridge-token"), json={"notMethodCalls": []})
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"), json={"using": USING, "notMethodCalls": []}
+        )
         assert response.status_code == 400
+
+
+def test_healthz_reports_request_metrics(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        before = client.get("/healthz").json()["metrics"]
+        client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Core/echo", {}, "c0"]]},
+        )
+        client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Unknown/method", {}, "c0"]]},
+        )
+        after = client.get("/healthz").json()["metrics"]
+        assert after["requests_total"] == before["requests_total"] + 2
+        assert after["errors_total"] == before["errors_total"] + 1
+
+
+def test_healthz_reports_sync_failures_but_request_still_succeeds(tmp_path):
+    class BrokenSyncClient(FakeClient):
+        def list_folders(self):
+            raise RuntimeError("network is down")
+
+    app = _app_with_fake_client(tmp_path, BrokenSyncClient())
+    with TestClient(app) as client:
+        before = client.get("/healthz").json()["metrics"]
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Core/echo", {}, "c0"]]},
+        )
+        assert response.status_code == 200
+        assert response.json()["methodResponses"] == [["Core/echo", {}, "c0"]]
+        after = client.get("/healthz").json()["metrics"]
+        assert after["sync_failures_total"] == before["sync_failures_total"] + 1
+
+
+def test_api_missing_using_is_rejected(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Core/echo", {}, "c0"]]},
+        )
+        assert response.status_code == 400
+        assert response.json()["type"] == "notRequest"
+
+
+def test_api_missing_core_capability_in_using_is_rejected(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": ["urn:ietf:params:jmap:mail"], "methodCalls": [["Core/echo", {}, "c0"]]},
+        )
+        assert response.status_code == 400
+        assert response.json()["type"] == "notRequest"
+
+
+def test_api_unknown_capability_in_using_is_rejected(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": ["urn:ietf:params:jmap:core", "urn:example:nonsense"],
+                  "methodCalls": [["Core/echo", {}, "c0"]]},
+        )
+        assert response.status_code == 400
+        assert response.json()["type"] == "unknownCapability"
 
 
 def test_api_syncs_then_serves_mailbox_get(tmp_path):
@@ -170,7 +246,7 @@ def test_api_syncs_then_serves_mailbox_get(tmp_path):
         response = client.post(
             "/api",
             headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
         )
         assert response.status_code == 200
         [[name, result, call_id]] = response.json()["methodResponses"]
@@ -195,6 +271,7 @@ def test_api_result_reference_across_calls(tmp_path):
             "/api",
             headers=_basic("alice", "bridge-token"),
             json={
+                "using": USING,
                 "methodCalls": [
                     ["Mailbox/get", {"accountId": "alice", "properties": ["id"]}, "c0"],
                     [
@@ -287,14 +364,15 @@ def test_mailbox_set_create_and_destroy(tmp_path):
     with TestClient(app) as client:
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
+            json={"using": USING,
+                  "methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
         )
         result = response.json()["methodResponses"][0][1]
         assert result["created"] == {"c1": {"id": "new1"}}
 
         destroy_response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
         )
         destroy_result = destroy_response.json()["methodResponses"][0][1]
         assert destroy_result["destroyed"] == ["new1"]
@@ -307,11 +385,12 @@ def test_mailbox_set_destroy_forbidden_by_policy(tmp_path):
     with TestClient(app) as client:
         client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
+            json={"using": USING,
+                  "methodCalls": [["Mailbox/set", {"accountId": "alice", "create": {"c1": {"name": "Test"}}}, "c0"]]},
         )
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Mailbox/set", {"accountId": "alice", "destroy": ["new1"]}, "c0"]]},
         )
         result = response.json()["methodResponses"][0][1]
         assert result["notDestroyed"]["new1"]["type"] == "forbidden"
@@ -336,7 +415,7 @@ def test_email_set_create_draft_with_uploaded_attachment(tmp_path):
         # Sync once so the Drafts mailbox is cached (needed for the mailboxIds role check).
         client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
         )
 
         upload = client.post(
@@ -347,7 +426,7 @@ def test_email_set_create_draft_with_uploaded_attachment(tmp_path):
 
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Email/set", {
+            json={"using": USING, "methodCalls": [["Email/set", {
                 "accountId": "alice",
                 "create": {
                     "c1": {
@@ -383,13 +462,13 @@ def test_email_set_destroy_forbidden_by_policy(tmp_path):
     with TestClient(app) as client:
         mailbox_get = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
         )
         email_id = mailbox_get.json()["methodResponses"][0][1]["ids"][0]
 
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Email/set", {"accountId": "alice", "destroy": [email_id]}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Email/set", {"accountId": "alice", "destroy": [email_id]}, "c0"]]},
         )
         result = response.json()["methodResponses"][0][1]
         assert result["notDestroyed"][email_id]["type"] == "forbidden"
@@ -404,7 +483,7 @@ def test_identity_get_returns_configured_email(tmp_path):
     with TestClient(app) as client:
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Identity/get", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Identity/get", {"accountId": "alice"}, "c0"]]},
         )
         result = response.json()["methodResponses"][0][1]
         assert result["list"][0]["email"] == "alice@example.com"
@@ -429,19 +508,19 @@ def test_email_submission_set_sends_referenced_email(tmp_path):
     with TestClient(app) as client:
         query = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
         )
         email_id = query.json()["methodResponses"][0][1]["ids"][0]
 
         identity_response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Identity/get", {"accountId": "alice"}, "cid"]]},
+            json={"using": USING, "methodCalls": [["Identity/get", {"accountId": "alice"}, "cid"]]},
         )
         identity_id = identity_response.json()["methodResponses"][0][1]["list"][0]["id"]
 
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["EmailSubmission/set", {
+            json={"using": USING, "methodCalls": [["EmailSubmission/set", {
                 "accountId": "alice",
                 "create": {"s1": {"identityId": identity_id, "emailId": email_id}},
             }, "c1"]]},
@@ -469,13 +548,13 @@ def test_email_submission_set_forbidden_by_policy(tmp_path):
     with TestClient(app) as client:
         query = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
         )
         email_id = query.json()["methodResponses"][0][1]["ids"][0]
 
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"methodCalls": [["EmailSubmission/set", {
+            json={"using": USING, "methodCalls": [["EmailSubmission/set", {
                 "accountId": "alice", "create": {"s1": {"identityId": "identity", "emailId": email_id}},
             }, "c0"]]},
         )

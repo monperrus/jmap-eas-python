@@ -272,3 +272,12 @@ def test_sync_account_reconciles_and_syncs_every_folder(tmp_path):
     ))
     coordinator.sync_account("alice", adapter)
     assert {m.mailbox_id for m in cache.list_mailboxes(database.conn, "alice")} == {"1", "2"}
+
+
+def test_sync_account_prunes_change_log(tmp_path, monkeypatch):
+    coordinator, database = _coordinator(tmp_path)
+    adapter = EasAdapter(FakeEasClient(folders=[], sync_responses={}))
+    calls = []
+    monkeypatch.setattr(state, "prune_change_log", lambda conn, account_id: calls.append(account_id))
+    coordinator.sync_account("alice", adapter)
+    assert calls == ["alice"]

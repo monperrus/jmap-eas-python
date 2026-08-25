@@ -44,6 +44,37 @@ def current_state(conn: sqlite3.Connection, account_id: str, type_: str) -> str:
     return str(row[0])
 
 
+def _pruned_through_seq(conn: sqlite3.Connection, account_id: str) -> int:
+    row = conn.execute(
+        "SELECT pruned_through_seq FROM change_log_retention WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def prune_change_log(conn: sqlite3.Connection, account_id: str, *, keep: int = 100_000) -> None:
+    """Deletes change_log rows older than the most recent `keep`, across all types.
+
+    Records a retention watermark (`change_log_retention`) so a `*/changes` or
+    `*/queryChanges` call whose `sinceState` refers to deleted history raises
+    `CannotCalculateChangesError` instead of silently under-reporting (plan.md
+    section 4's "cache maintenance" note -- unbounded retention doesn't scale,
+    but truncating it must never look like "nothing changed").
+    """
+    latest = int(
+        conn.execute("SELECT COALESCE(MAX(seq), 0) FROM change_log WHERE account_id = ?", (account_id,)).fetchone()[0]
+    )
+    cutoff = latest - keep
+    if cutoff <= 0:
+        return
+    conn.execute("DELETE FROM change_log WHERE account_id = ? AND seq <= ?", (account_id, cutoff))
+    conn.execute(
+        "INSERT INTO change_log_retention (account_id, pruned_through_seq) VALUES (?, ?) "
+        "ON CONFLICT (account_id) DO UPDATE SET "
+        "pruned_through_seq = MAX(pruned_through_seq, excluded.pruned_through_seq)",
+        (account_id, cutoff),
+    )
+
+
 def _parse_state(value: str) -> int:
     try:
         parsed = int(value)
@@ -98,6 +129,8 @@ def get_changes(
     latest = _parse_state(current_state(conn, account_id, type_))
     if since > latest:
         raise CannotCalculateChangesError(f"state {since_state!r} is ahead of the current state")
+    if since < _pruned_through_seq(conn, account_id):
+        raise CannotCalculateChangesError(f"state {since_state!r} refers to change history that has been pruned")
 
     rows = conn.execute(
         "SELECT seq, object_id, change FROM change_log WHERE account_id = ? AND type = ? AND seq > ? ORDER BY seq",
