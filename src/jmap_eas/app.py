@@ -14,6 +14,8 @@ from typing import Any
 import uvicorn
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
@@ -332,7 +334,10 @@ def create_app(config: AppConfig | None = None) -> Starlette:
         Route("/upload/{account_id}", upload, methods=["POST"]),
         Route("/eventsource", eventsource),
     ]
-    app = Starlette(routes=routes, lifespan=_lifespan)
+    middleware = [
+        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+    ]
+    app = Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)
     app.state.jmap_eas = _build_state(config)
     return app
 
