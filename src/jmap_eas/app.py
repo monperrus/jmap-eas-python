@@ -65,7 +65,7 @@ def _build_state(config: AppConfig) -> AppState:
     configure_logging()
     database = store_db.connect(config.server.db_path)
     registry = AccountRegistry(config.accounts)
-    sync = SyncCoordinator(database)
+    sync = SyncCoordinator(database, freshness_seconds=config.server.sync_freshness_seconds)
     dispatcher = Dispatcher(policy.METHODS)
     return AppState(config, registry, database, sync, dispatcher, Metrics())
 

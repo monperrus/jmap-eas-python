@@ -155,6 +155,49 @@ def test_list_emails_in_mailbox_and_for_account(tmp_path):
     assert {e.email_id for e in cache.list_emails_for_account(database.conn, "alice")} == {"e1", "e2"}
 
 
+def test_set_email_live_summary_persists_and_is_read_back(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email())
+        cache.set_email_live_summary(conn, "alice", "e1", preview="hi there", size=123, has_attachment=True)
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.cached_preview == "hi there"
+    assert stored.cached_size == 123
+    assert stored.cached_has_attachment is True
+
+
+def test_upsert_email_clears_previously_cached_live_summary(tmp_path):
+    """issue #2: re-applying an item from `Sync` (a create or a change) must invalidate any
+    cached `Email/get` summary, since the underlying content may have changed."""
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email())
+        cache.set_email_live_summary(conn, "alice", "e1", preview="hi there", size=123, has_attachment=True)
+        cache.upsert_email(conn, _email(subject="Updated"))
+    stored = cache.get_email(database.conn, "alice", "e1")
+    assert stored.cached_preview is None
+    assert stored.cached_size is None
+    assert stored.cached_has_attachment is None
+
+
+def test_query_emails_page_orders_by_received_at_descending_and_paginates(tmp_path):
+    database = _db(tmp_path)
+    with database.transaction() as conn:
+        cache.upsert_email(conn, _email(email_id="e1", mailbox_id="1", received_at="2026-01-01T00:00:00Z"))
+        cache.upsert_email(conn, _email(email_id="e2", mailbox_id="1", server_id="9:2",
+                                         received_at="2026-01-03T00:00:00Z"))
+        cache.upsert_email(conn, _email(email_id="e3", mailbox_id="1", server_id="9:3",
+                                         received_at="2026-01-02T00:00:00Z"))
+        cache.upsert_email(conn, _email(email_id="e4", mailbox_id="2", server_id="9:4",
+                                         received_at="2026-01-04T00:00:00Z"))
+
+    full = cache.query_emails_page(database.conn, "alice", "1", offset=0, limit=None)
+    assert [e.email_id for e in full] == ["e2", "e3", "e1"]
+
+    page = cache.query_emails_page(database.conn, "alice", "1", offset=1, limit=1)
+    assert [e.email_id for e in page] == ["e3"]
+
+
 def test_list_thread_email_ids(tmp_path):
     database = _db(tmp_path)
     with database.transaction() as conn:

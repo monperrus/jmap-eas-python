@@ -38,6 +38,10 @@ CHEAP_PROPERTIES = [
     "id", "blobId", "mailboxIds", "threadId", "subject", "from", "to", "cc", "replyTo", "receivedAt", "keywords",
 ]
 LIVE_PROPERTIES = {"size", "preview", "hasAttachment", "bodyValues", "textBody", "htmlBody", "attachments"}
+SUMMARY_LIVE_PROPERTIES = {"size", "preview", "hasAttachment"}
+"""The subset of `LIVE_PROPERTIES` `get()` can serve from `EmailRecord.cached_*` alone (issue
+#2) once populated -- the rest (`attachments`, `bodyValues`, `textBody`, `htmlBody`) always need
+the full MIME body, so any request for one of those still fetches live."""
 ALWAYS_NULL_PROPERTIES = {"bcc", "sender", "sentAt", "inReplyTo", "references", "messageId", "bodyStructure"}
 ALL_PROPERTIES = set(CHEAP_PROPERTIES) | LIVE_PROPERTIES | ALWAYS_NULL_PROPERTIES
 
@@ -111,6 +115,20 @@ def _fetch_live_data(record: EmailRecord, adapter: EasAdapter) -> dict[str, Any]
     }
 
 
+def _cached_summary(record: EmailRecord) -> dict[str, Any]:
+    """A `_fetch_live_data()`-shaped dict built from `EmailRecord.cached_*` alone (issue #2),
+    for a request that only needs `SUMMARY_LIVE_PROPERTIES` and already has them cached."""
+    return {
+        "size": record.cached_size,
+        "preview": record.cached_preview,
+        "hasAttachment": bool(record.cached_has_attachment),
+        "attachments": [],
+        "textBody": [],
+        "htmlBody": [],
+        "bodyValues": {"text": None, "html": None},
+    }
+
+
 def _body_part(record: EmailRecord, part_id: str, content: str | None) -> list[dict[str, Any]]:
     if content is None:
         return []
@@ -172,7 +190,9 @@ def get(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
     fetch_all = bool(arguments.get("fetchAllBodyValues"))
     want_text = fetch_text or fetch_all
     want_html = fetch_html or fetch_all
-    needs_live = bool(set(properties) & LIVE_PROPERTIES) or want_text or want_html
+    requested_live = set(properties) & LIVE_PROPERTIES
+    needs_live = bool(requested_live) or want_text or want_html
+    summary_only = needs_live and not want_text and not want_html and requested_live <= SUMMARY_LIVE_PROPERTIES
 
     with env.database.transaction() as conn:
         records: list[EmailRecord] = []
@@ -187,7 +207,18 @@ def get(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
 
     jmap_list = []
     for record in records:
-        live = _fetch_live_data(record, env.adapter) if needs_live else None
+        live: dict[str, Any] | None = None
+        if needs_live:
+            if summary_only and record.cached_size is not None:
+                live = _cached_summary(record)
+            else:
+                live = _fetch_live_data(record, env.adapter)
+                if live is not None:
+                    with env.database.transaction() as conn:
+                        cache.set_email_live_summary(
+                            conn, env.account_id, record.email_id,
+                            preview=live["preview"], size=live["size"], has_attachment=live["hasAttachment"],
+                        )
         jmap_list.append(_to_jmap(record, properties, live, want_text=want_text, want_html=want_html))
     return {"accountId": env.account_id, "state": current, "list": jmap_list, "notFound": not_found}
 
@@ -242,32 +273,52 @@ _SORT_KEYS = {
     "subject": lambda r: (r.subject or "").lower(),
 }
 
+_DEFAULT_SORT = [{"property": "receivedAt", "isAscending": False}]
+
+
+def _fast_path_mailbox_id(filter_: dict[str, Any] | None, sort: list[dict[str, Any]]) -> str | None:
+    """The mailbox id if `filter_`/`sort` are exactly the common `inMailbox` + `receivedAt` DESC
+    query (issue #2), else `None`. Lets `query()` use `cache.query_emails_page()`'s indexed SQL
+    page instead of loading and sorting every cached email in the account."""
+    if not isinstance(filter_, dict) or set(filter_) != {"inMailbox"}:
+        return None
+    mailbox_id = filter_.get("inMailbox")
+    if not isinstance(mailbox_id, str):
+        return None
+    return mailbox_id if sort == _DEFAULT_SORT else None
+
 
 def query(env: Environment, arguments: dict[str, Any]) -> dict[str, Any]:
     filter_ = arguments.get("filter")
-    sort = arguments.get("sort") or [{"property": "receivedAt", "isAscending": False}]
+    sort = arguments.get("sort") or _DEFAULT_SORT
     position = arguments.get("position", 0)
     limit = arguments.get("limit")
     calculate_total = arguments.get("calculateTotal", False)
 
+    fast_mailbox_id = _fast_path_mailbox_id(filter_, sort) if position >= 0 else None
+
     with env.database.transaction() as conn:
-        records = [
-            r for r in cache.list_emails_for_account(conn, env.account_id)
-            if evaluate_filter(filter_, r, _match_condition)
-        ]
         current = state.current_state(conn, env.account_id, "Email")
+        if fast_mailbox_id is not None:
+            total = cache.count_emails_in_mailbox(conn, env.account_id, fast_mailbox_id)[0] if calculate_total \
+                else None
+            window = cache.query_emails_page(conn, env.account_id, fast_mailbox_id, offset=position, limit=limit)
+        else:
+            records = [
+                r for r in cache.list_emails_for_account(conn, env.account_id)
+                if evaluate_filter(filter_, r, _match_condition)
+            ]
+            for comparator in reversed(sort):
+                prop = comparator.get("property")
+                key = _SORT_KEYS.get(prop)
+                if key is None:
+                    raise InvalidArgumentsError(f"unsupported Email/query sort property: {prop!r}")
+                records.sort(key=key, reverse=not comparator.get("isAscending", True))
+            total = len(records)
+            if position < 0:
+                position = max(total + position, 0)
+            window = records[position: position + limit] if limit is not None else records[position:]
 
-    for comparator in reversed(sort):
-        prop = comparator.get("property")
-        key = _SORT_KEYS.get(prop)
-        if key is None:
-            raise InvalidArgumentsError(f"unsupported Email/query sort property: {prop!r}")
-        records.sort(key=key, reverse=not comparator.get("isAscending", True))
-
-    total = len(records)
-    if position < 0:
-        position = max(total + position, 0)
-    window = records[position: position + limit] if limit is not None else records[position:]
     result: dict[str, Any] = {
         "accountId": env.account_id,
         "queryState": current,

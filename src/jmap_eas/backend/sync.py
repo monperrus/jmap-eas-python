@@ -20,6 +20,7 @@ import threading
 import time
 from collections.abc import Callable
 from email.message import Message
+from typing import Any
 
 from pyactivesync.models import EmailChange, FolderType, SyncItem
 
@@ -34,32 +35,57 @@ DEFAULT_MAX_PAGES_PER_CALL = 10
 must not mean "block until a multi-year mailbox is fully synced"). A folder with more pending
 pages than this simply finishes over subsequent calls -- its SyncKey is persisted after every page."""
 
-DEFAULT_FRESHNESS_SECONDS = 5.0
-"""How long `ensure_folders_reconciled()`/`ensure_folder_synced()` trust a sync they just did
-(plan.md's per-request scoping): a foreground request repeating within this window serves the
-cache as-is instead of repeating the same EAS round trip. Push/Ping-driven syncing (the
-`/eventsource` stream) and every direct mutation are unaffected -- they call `reconcile_folders()`
-/`sync_folder()` directly, which always hit EAS."""
+DEFAULT_FRESHNESS_SECONDS = 30.0
+"""How long `ensure_folders_reconciled()`/`ensure_folder_synced()` trust a sync they just
+*finished* (plan.md's per-request scoping): a foreground request repeating within this window
+serves the cache as-is instead of repeating the same EAS round trip. Live EAS `Sync` calls
+routinely take several seconds against a large mailbox, so this must comfortably exceed one
+round trip -- a window shorter than that expires before the sync it's supposed to cover even
+completes (issue #2). Push/Ping-driven syncing (the `/eventsource` stream) and every direct
+mutation are unaffected -- they call `reconcile_folders()`/`sync_folder()` directly, which
+always hit EAS."""
 
 
 class SyncCoordinator:
-    def __init__(self, database: Database, *, max_pages_per_call: int = DEFAULT_MAX_PAGES_PER_CALL) -> None:
+    def __init__(
+        self, database: Database, *, max_pages_per_call: int = DEFAULT_MAX_PAGES_PER_CALL,
+        freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
+    ) -> None:
         self._database = database
         self._max_pages_per_call = max_pages_per_call
+        self._freshness_seconds = freshness_seconds
         self._folder_locks: dict[tuple[str, str], threading.Lock] = {}
-        self._folder_locks_guard = threading.Lock()
+        self._account_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
         self._reconciled_at: dict[str, float] = {}
         self._folder_synced_at: dict[tuple[str, str], float] = {}
         self._freshness_guard = threading.Lock()
 
     def _folder_lock(self, account_id: str, folder_id: str) -> threading.Lock:
         key = (account_id, folder_id)
-        with self._folder_locks_guard:
+        with self._locks_guard:
             lock = self._folder_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
                 self._folder_locks[key] = lock
             return lock
+
+    def _account_lock(self, account_id: str) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._account_locks.get(account_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._account_locks[account_id] = lock
+            return lock
+
+    def _is_fresh(self, table: dict[Any, float], key: Any, max_age: float) -> bool:
+        with self._freshness_guard:
+            seen_at = table.get(key)
+            return seen_at is not None and time.monotonic() - seen_at < max_age
+
+    def _mark_fresh(self, table: dict[Any, float], key: Any) -> None:
+        with self._freshness_guard:
+            table[key] = time.monotonic()
 
     def reconcile_folders(self, account_id: str, adapter: EasAdapter) -> None:
         """Full `FolderSync` listing, diffed against the cache and applied in one transaction.
@@ -90,18 +116,22 @@ class SyncCoordinator:
         with more pending pages than the cap simply finishes over later calls.
         """
         with self._folder_lock(account_id, folder_id):
-            with self._database.transaction() as conn:
-                mailbox = cache.get_mailbox(conn, account_id, folder_id)
-            sync_key = mailbox.sync_key if mailbox is not None else "0"
-            pages_applied = 0
-            while True:
-                was_bootstrap = sync_key == "0"
-                sync_key, more_available = self._sync_folder_once(account_id, folder_id, adapter, sync_key)
-                if was_bootstrap:
-                    continue
-                pages_applied += 1
-                if not more_available or pages_applied >= self._max_pages_per_call:
-                    break
+            self._sync_folder_locked(account_id, folder_id, adapter)
+
+    def _sync_folder_locked(self, account_id: str, folder_id: str, adapter: EasAdapter) -> None:
+        """`sync_folder()`'s body, run by a caller that already holds this folder's lock."""
+        with self._database.transaction() as conn:
+            mailbox = cache.get_mailbox(conn, account_id, folder_id)
+        sync_key = mailbox.sync_key if mailbox is not None else "0"
+        pages_applied = 0
+        while True:
+            was_bootstrap = sync_key == "0"
+            sync_key, more_available = self._sync_folder_once(account_id, folder_id, adapter, sync_key)
+            if was_bootstrap:
+                continue
+            pages_applied += 1
+            if not more_available or pages_applied >= self._max_pages_per_call:
+                break
 
     def sync_account(self, account_id: str, adapter: EasAdapter) -> None:
         """Reconcile folders, sync every mailbox's items, then prune old change-log history."""
@@ -116,27 +146,44 @@ class SyncCoordinator:
     # -- Request-scoped freshness (plan.md's per-request sync scoping) ---------------
 
     def ensure_folders_reconciled(
-        self, account_id: str, adapter: EasAdapter, *, max_age: float = DEFAULT_FRESHNESS_SECONDS
+        self, account_id: str, adapter: EasAdapter, *, max_age: float | None = None
     ) -> None:
-        """`reconcile_folders()`, skipped if this account was already reconciled within `max_age`."""
-        with self._freshness_guard:
-            seen_at = self._reconciled_at.get(account_id)
-            if seen_at is not None and time.monotonic() - seen_at < max_age:
+        """`reconcile_folders()`, skipped if this account was already reconciled within `max_age`
+        (the coordinator's configured `freshness_seconds` if not given explicitly).
+
+        Freshness is measured from when a reconcile *finishes*, not when it starts, and is only
+        recorded on success -- a failed reconcile leaves the account due immediately, not fresh
+        for a window it never actually satisfied. Freshness is rechecked after acquiring this
+        account's lock so concurrent callers that queued behind an in-flight reconcile reuse its
+        result instead of each repeating it (issue #2)."""
+        effective_max_age = self._freshness_seconds if max_age is None else max_age
+        if self._is_fresh(self._reconciled_at, account_id, effective_max_age):
+            return
+        with self._account_lock(account_id):
+            if self._is_fresh(self._reconciled_at, account_id, effective_max_age):
                 return
-            self._reconciled_at[account_id] = time.monotonic()
-        self.reconcile_folders(account_id, adapter)
+            self.reconcile_folders(account_id, adapter)
+            self._mark_fresh(self._reconciled_at, account_id)
 
     def ensure_folder_synced(
-        self, account_id: str, folder_id: str, adapter: EasAdapter, *, max_age: float = DEFAULT_FRESHNESS_SECONDS
+        self, account_id: str, folder_id: str, adapter: EasAdapter, *, max_age: float | None = None
     ) -> None:
-        """`sync_folder()`, skipped if this folder was already synced within `max_age`."""
+        """`sync_folder()`, skipped if this folder was already synced within `max_age` (the
+        coordinator's configured `freshness_seconds` if not given explicitly).
+
+        Same freshness contract as `ensure_folders_reconciled()`: recorded only after a
+        successful sync completes, and rechecked after acquiring the folder's own lock (the one
+        `sync_folder()` itself takes) so concurrent callers for the same folder result in at most
+        one EAS `Sync` (issue #2)."""
+        effective_max_age = self._freshness_seconds if max_age is None else max_age
         key = (account_id, folder_id)
-        with self._freshness_guard:
-            seen_at = self._folder_synced_at.get(key)
-            if seen_at is not None and time.monotonic() - seen_at < max_age:
+        if self._is_fresh(self._folder_synced_at, key, effective_max_age):
+            return
+        with self._folder_lock(account_id, folder_id):
+            if self._is_fresh(self._folder_synced_at, key, effective_max_age):
                 return
-            self._folder_synced_at[key] = time.monotonic()
-        self.sync_folder(account_id, folder_id, adapter)
+            self._sync_folder_locked(account_id, folder_id, adapter)
+            self._mark_fresh(self._folder_synced_at, key)
 
     def _sync_folder_once(
         self, account_id: str, folder_id: str, adapter: EasAdapter, sync_key: str

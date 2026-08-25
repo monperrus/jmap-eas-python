@@ -88,6 +88,18 @@ MIGRATIONS: tuple[str, ...] = (
         pruned_through_seq INTEGER NOT NULL DEFAULT 0
     );
     """,
+    """
+    -- issue #2: an indexed fast path for the common `inMailbox` + `receivedAt` DESC + `limit`
+    -- `Email/query`, instead of deserializing and sorting every cached email in the account.
+    CREATE INDEX emails_by_mailbox_received_at ON emails (account_id, mailbox_id, received_at DESC);
+
+    -- issue #2: cached `Email/get` live-data summary (populated lazily on first fetch, cleared
+    -- whenever `Sync` reports the item added/changed) so a repeat page of `size`/`preview`/
+    -- `hasAttachment` doesn't repeat one `ItemOperations` MIME download per message.
+    ALTER TABLE emails ADD COLUMN preview TEXT;
+    ALTER TABLE emails ADD COLUMN size INTEGER;
+    ALTER TABLE emails ADD COLUMN has_attachment INTEGER;
+    """,
 )
 
 

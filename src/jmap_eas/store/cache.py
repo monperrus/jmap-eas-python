@@ -46,6 +46,9 @@ def _email_from_row(row: sqlite3.Row) -> EmailRecord:
         received_at=row["received_at"],
         seen=bool(row["seen"]),
         flagged=bool(row["flagged"]),
+        cached_preview=row["preview"],
+        cached_size=row["size"],
+        cached_has_attachment=None if row["has_attachment"] is None else bool(row["has_attachment"]),
     )
 
 
@@ -150,12 +153,20 @@ def list_thread_email_ids(conn: sqlite3.Connection, account_id: str, thread_id: 
 
 
 def upsert_email(conn: sqlite3.Connection, email: EmailRecord) -> None:
+    """Insert or replace one email's synced fields.
+
+    Also (re)writes the cached live-data summary columns from `email.cached_*` -- callers that
+    map fresh `Sync` data (the only callers today) never set those fields, so this naturally
+    invalidates any previously cached `preview`/`size`/`hasAttachment` whenever an item is
+    created or changed (issue #2): the next `Email/get` summary request re-fetches it live.
+    """
     conn.execute(
         """
         INSERT INTO emails (
             account_id, email_id, mailbox_id, server_id, thread_id, subject,
-            from_json, to_json, cc_json, reply_to_json, received_at, seen, flagged
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            from_json, to_json, cc_json, reply_to_json, received_at, seen, flagged,
+            preview, size, has_attachment
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (account_id, email_id) DO UPDATE SET
             mailbox_id = excluded.mailbox_id,
             server_id = excluded.server_id,
@@ -167,14 +178,32 @@ def upsert_email(conn: sqlite3.Connection, email: EmailRecord) -> None:
             reply_to_json = excluded.reply_to_json,
             received_at = excluded.received_at,
             seen = excluded.seen,
-            flagged = excluded.flagged
+            flagged = excluded.flagged,
+            preview = excluded.preview,
+            size = excluded.size,
+            has_attachment = excluded.has_attachment
         """,
         (
             email.account_id, email.email_id, email.mailbox_id, email.server_id, email.thread_id, email.subject,
             _addresses_to_json(email.from_addresses), _addresses_to_json(email.to_addresses),
             _addresses_to_json(email.cc_addresses), _addresses_to_json(email.reply_to_addresses),
             email.received_at, int(email.seen), int(email.flagged),
+            email.cached_preview, email.cached_size,
+            None if email.cached_has_attachment is None else int(email.cached_has_attachment),
         ),
+    )
+
+
+def set_email_live_summary(
+    conn: sqlite3.Connection, account_id: str, email_id: str, *, preview: str, size: int, has_attachment: bool
+) -> None:
+    """Persists an `Email/get` live-data fetch's summary fields (issue #2), so a later
+    summary-only request for the same email is served from the cache instead of repeating the
+    `ItemOperations` MIME download. Cleared back to unset by the next `upsert_email()` from
+    `Sync` if the item changes."""
+    conn.execute(
+        "UPDATE emails SET preview = ?, size = ?, has_attachment = ? WHERE account_id = ? AND email_id = ?",
+        (preview, size, int(has_attachment), account_id, email_id),
     )
 
 
@@ -210,6 +239,22 @@ def list_emails_in_mailbox(conn: sqlite3.Connection, account_id: str, mailbox_id
 def list_emails_for_account(conn: sqlite3.Connection, account_id: str) -> list[EmailRecord]:
     """All cached emails for `account_id`, across every mailbox. `Email/query` filters and sorts these itself."""
     rows = conn.execute("SELECT * FROM emails WHERE account_id = ?", (account_id,)).fetchall()
+    return [_email_from_row(row) for row in rows]
+
+
+def query_emails_page(
+    conn: sqlite3.Connection, account_id: str, mailbox_id: str, *, offset: int, limit: int | None
+) -> list[EmailRecord]:
+    """One page of `mailbox_id`'s emails, newest `received_at` first (issue #2's fast path for
+    `Email/query`'s common `inMailbox` + `receivedAt` DESC + `limit` case): an indexed, bounded
+    SQL query (`emails_by_mailbox_received_at`) instead of deserializing every cached email in
+    the account to filter, sort, and slice in Python. `limit=None` returns every remaining row
+    from `offset` on, matching `Email/query`'s no-limit behavior."""
+    rows = conn.execute(
+        "SELECT * FROM emails WHERE account_id = ? AND mailbox_id = ? "
+        "ORDER BY received_at DESC LIMIT ? OFFSET ?",
+        (account_id, mailbox_id, -1 if limit is None else limit, offset),
+    ).fetchall()
     return [_email_from_row(row) for row in rows]
 
 

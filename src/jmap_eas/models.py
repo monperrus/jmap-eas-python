@@ -48,3 +48,9 @@ class EmailRecord:
     received_at: str | None = None
     seen: bool = False
     flagged: bool = False
+    cached_preview: str | None = None
+    cached_size: int | None = None
+    cached_has_attachment: bool | None = None
+    """`Email/get` live-data summary, persisted after the first `ItemOperations` fetch and
+    cleared by every `upsert_email()` call from `Sync` (issue #2): `None` means "not fetched
+    since this item's content last changed," not "no attachment" or "empty preview.\""""

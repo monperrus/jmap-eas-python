@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
+
+import pytest
 from pyactivesync.models import Folder, FolderType, SyncItem, SyncResult
 
 from jmap_eas.backend.eas import EasAdapter
 from jmap_eas.backend.sync import SyncCoordinator
+from jmap_eas.errors import BackendError
 from jmap_eas.store import cache, db, state
 
 
@@ -32,6 +37,21 @@ class FakeEasClient:
 
     def close(self) -> None:
         pass
+
+
+class SlowEasClient(FakeEasClient):
+    """A `FakeEasClient` whose `sync_folder()` takes measurable time and records each call's
+    sync key, so tests can assert on how many EAS round trips actually happened."""
+
+    def __init__(self, *, folders, sync_responses, delay: float = 0.05) -> None:
+        super().__init__(folders=folders, sync_responses=sync_responses)
+        self._delay = delay
+        self.calls: list[str] = []
+
+    def sync_folder(self, folder_id, sync_key="0", *, window_size=100, filter_type=None):
+        self.calls.append(sync_key)
+        time.sleep(self._delay)
+        return super().sync_folder(folder_id, sync_key, window_size=window_size, filter_type=filter_type)
 
 
 def _coordinator(tmp_path):
@@ -325,3 +345,78 @@ def test_ensure_folder_synced_skips_within_freshness_window(tmp_path):
     # No more scripted responses left; a second call within the window must not hit EAS again.
     coordinator.ensure_folder_synced("alice", "1", adapter, max_age=60)
     assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "2"
+
+
+def test_ensure_folder_synced_stays_fresh_even_when_sync_outlasts_the_freshness_window(tmp_path):
+    """issue #2: freshness is stamped when a sync *finishes*, not when it starts, so a window
+    shorter than the sync itself doesn't already look expired the moment the sync completes."""
+    coordinator, database = _coordinator(tmp_path)
+    client = SlowEasClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_responses={"1": [
+            SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+            SyncResult(sync_key="2", added=[], changed=[], deleted=[], more_available=False),
+        ]},
+        delay=0.05,
+    )
+    adapter = EasAdapter(client)
+    coordinator.reconcile_folders("alice", adapter)
+
+    # The sync itself takes ~0.1s (two calls at 0.05s each); the freshness window is far shorter.
+    coordinator.ensure_folder_synced("alice", "1", adapter, max_age=0.01)
+    assert len(client.calls) == 2
+
+    # An immediate follow-up must still be served from the cache: the sync that just ran is
+    # timestamped *now*, not 0.1s ago, so it hasn't expired despite the tiny window.
+    coordinator.ensure_folder_synced("alice", "1", adapter, max_age=0.01)
+    assert len(client.calls) == 2
+
+
+def test_ensure_folder_synced_concurrent_callers_sync_at_most_once(tmp_path):
+    """issue #2: concurrent scoped requests for the same folder must not each perform their own
+    EAS Sync -- a caller that queues behind an in-flight sync reuses its result."""
+    coordinator, database = _coordinator(tmp_path)
+    client = SlowEasClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_responses={"1": [
+            SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+            SyncResult(sync_key="2", added=[], changed=[], deleted=[], more_available=False),
+        ]},
+        delay=0.05,
+    )
+    adapter = EasAdapter(client)
+    coordinator.reconcile_folders("alice", adapter)
+
+    threads = [
+        threading.Thread(target=coordinator.ensure_folder_synced, args=("alice", "1", adapter), kwargs={"max_age": 60})
+        for _ in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one bootstrap-then-page cycle happened, not one per thread -- extra callers would
+    # have exhausted the two scripted responses and raised inside their thread.
+    assert client.calls == ["0", "1"]
+    assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "2"
+
+
+def test_ensure_folder_synced_does_not_mark_a_failed_sync_fresh(tmp_path):
+    """issue #2: a sync that raises must not be treated as having satisfied the freshness
+    window -- the next request should retry immediately rather than serving stale data."""
+    coordinator, database = _coordinator(tmp_path)
+
+    class FailingClient(FakeEasClient):
+        def sync_folder(self, *a, **k):
+            raise RuntimeError("boom")
+
+    adapter = EasAdapter(FailingClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")], sync_responses={},
+    ))
+    coordinator.reconcile_folders("alice", adapter)
+
+    with pytest.raises(BackendError):
+        coordinator.ensure_folder_synced("alice", "1", adapter, max_age=60)
+    with pytest.raises(BackendError):
+        coordinator.ensure_folder_synced("alice", "1", adapter, max_age=60)

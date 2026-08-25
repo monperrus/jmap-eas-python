@@ -46,6 +46,7 @@ class FakeClient:
         self.apply_calls: list[tuple] = []
         self.draft_calls: list[tuple] = []
         self.move_calls: list[tuple] = []
+        self.fetch_item_calls: list[tuple] = []
 
     def provision(self):
         return "policy-key"
@@ -57,6 +58,7 @@ class FakeClient:
         raise NotImplementedError
 
     def fetch_item(self, folder_id, item_id, *, body_type=BodyType.HTML):
+        self.fetch_item_calls.append((folder_id, item_id))
         if self._fail:
             from pyactivesync.exceptions import StatusError
             raise StatusError("ItemOperations", "12")
@@ -217,6 +219,68 @@ def test_get_live_fetch_reports_attachments(tmp_path):
     assert obj["attachments"][0]["blobId"]
 
 
+def test_get_summary_properties_are_cached_after_first_live_fetch(tmp_path):
+    """issue #2: a repeat `Email/get` for the same summary properties must not repeat the
+    `ItemOperations` MIME download -- the first fetch's result is persisted to the cache."""
+    client = FakeClient(mime=_mime_bytes(text="body text"))
+    env, database = _env(tmp_path, client=client)
+    _seed(database)
+
+    first = email.get(env, {"ids": ["e1"], "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 1
+
+    second = email.get(env, {"ids": ["e1"], "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 1  # served from the cached summary, no second fetch
+    assert second["list"] == first["list"]
+
+
+def test_get_summary_cache_covers_a_full_page_of_ids(tmp_path):
+    """issue #2 acceptance: a cached page of many messages must not perform one
+    `ItemOperations` call per message on a repeat request."""
+    client = FakeClient(mime=_mime_bytes(text="body text"))
+    env, database = _env(tmp_path, client=client)
+    for i in range(50):
+        _seed(database, email_id=f"e{i}", server_id=f"9:{i}")
+    ids = [f"e{i}" for i in range(50)]
+
+    email.get(env, {"ids": ids, "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 50
+
+    email.get(env, {"ids": ids, "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 50  # no further fetches on the cached repeat
+
+
+def test_get_full_body_fetch_is_not_served_from_the_summary_cache(tmp_path):
+    """Only the `size`/`preview`/`hasAttachment` summary is cached; a request that also needs
+    body content always re-fetches live, since text/HTML bodies are not persisted."""
+    client = FakeClient(mime=_mime_bytes(text="body text"))
+    env, database = _env(tmp_path, client=client)
+    _seed(database)
+
+    email.get(env, {"ids": ["e1"], "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 1
+
+    email.get(env, {"ids": ["e1"], "properties": ["bodyValues"], "fetchAllBodyValues": True})
+    assert len(client.fetch_item_calls) == 2
+
+
+def test_get_summary_cache_is_invalidated_when_the_item_changes(tmp_path):
+    """issue #2: `upsert_email()` from a `Sync` change clears any previously cached summary, so
+    a stale preview/size isn't served after the item's content actually changed."""
+    client = FakeClient(mime=_mime_bytes(text="body text"))
+    env, database = _env(tmp_path, client=client)
+    record = _seed(database)
+
+    email.get(env, {"ids": ["e1"], "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 1
+
+    with database.transaction() as conn:
+        cache.upsert_email(conn, record)  # simulates a `Sync` re-applying this item
+
+    email.get(env, {"ids": ["e1"], "properties": ["size", "preview", "hasAttachment"]})
+    assert len(client.fetch_item_calls) == 2
+
+
 def test_get_text_body_values_only_populated_when_requested(tmp_path):
     client = FakeClient(mime=_mime_bytes(text="plain text", html="<p>html text</p>"))
     env, database = _env(tmp_path, client=client)
@@ -327,6 +391,51 @@ def test_query_rejects_unsupported_sort_property(tmp_path):
     _seed(database)
     with pytest.raises(InvalidArgumentsError):
         email.query(env, {"sort": [{"property": "size"}]})
+
+
+# -- query: indexed inMailbox + receivedAt DESC fast path (issue #2) -----------------
+
+
+def test_query_fast_path_matches_generic_path_for_scoped_mailbox_query(tmp_path):
+    """The `inMailbox`-only, default-sort case must return the same page whether or not it
+    takes the indexed SQL fast path -- exercised here with position/limit/calculateTotal."""
+    env, database = _env(tmp_path)
+    _seed(database, email_id="e1", mailbox_id="1", received_at="2026-01-01T00:00:00Z")
+    _seed(database, email_id="e2", mailbox_id="1", server_id="9:2", received_at="2026-01-03T00:00:00Z")
+    _seed(database, email_id="e3", mailbox_id="1", server_id="9:3", received_at="2026-01-02T00:00:00Z")
+    _seed(database, email_id="e4", mailbox_id="2", server_id="9:4", received_at="2026-01-04T00:00:00Z")
+
+    result = email.query(env, {"filter": {"inMailbox": "1"}, "position": 1, "limit": 1, "calculateTotal": True})
+    assert result["ids"] == ["e3"]  # newest-first: e2, e3, e1 -- position 1 is e3
+    assert result["total"] == 3
+
+
+def test_query_fast_path_not_used_for_non_default_sort_or_extra_conditions(tmp_path):
+    """A filter with more than `inMailbox`, or a non-default sort, must still work correctly
+    via the generic path (the fast path only covers the exact common case)."""
+    env, database = _env(tmp_path)
+    _seed(database, email_id="e1", mailbox_id="1", subject="Report", received_at="2026-01-01T00:00:00Z")
+    _seed(database, email_id="e2", mailbox_id="1", server_id="9:2", subject="Other",
+          received_at="2026-01-02T00:00:00Z")
+
+    result = email.query(env, {"filter": {"operator": "AND", "conditions": [
+        {"inMailbox": "1"}, {"subject": "Report"},
+    ]}})
+    assert result["ids"] == ["e1"]
+
+    ascending = email.query(env, {
+        "filter": {"inMailbox": "1"}, "sort": [{"property": "receivedAt", "isAscending": True}],
+    })
+    assert ascending["ids"] == ["e1", "e2"]
+
+
+def test_query_fast_path_with_no_limit_returns_every_remaining_row(tmp_path):
+    env, database = _env(tmp_path)
+    _seed(database, email_id="e1", mailbox_id="1", received_at="2026-01-01T00:00:00Z")
+    _seed(database, email_id="e2", mailbox_id="1", server_id="9:2", received_at="2026-01-02T00:00:00Z")
+
+    result = email.query(env, {"filter": {"inMailbox": "1"}, "position": 1})
+    assert result["ids"] == ["e1"]
 
 
 # -- changes -------------------------------------------------------------------------

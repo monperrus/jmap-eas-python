@@ -73,6 +73,11 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8080
     db_path: str = "jmap-eas.sqlite3"
+    sync_freshness_seconds: float = 30.0
+    """How long a per-request EAS sync is trusted before a repeat request triggers another one
+    (`SyncCoordinator`'s freshness window, issue #2). Must comfortably exceed how long one live
+    `Sync`/`FolderSync` round trip takes against this deployment's mailboxes, or every request
+    just resyncs again."""
 
 
 class AppConfig(BaseModel):
