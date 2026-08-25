@@ -31,6 +31,7 @@ class Environment:
     sync: SyncCoordinator
     adapter: EasAdapter
     policy: PolicyConfig
+    identity_email: str = ""
 
 
 MethodHandler = Callable[[Environment, dict[str, Any]], dict[str, Any]]

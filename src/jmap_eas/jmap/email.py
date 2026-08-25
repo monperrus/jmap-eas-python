@@ -64,7 +64,7 @@ def _make_preview(text: str | None, html: str | None) -> str:
     return collapsed[:256]
 
 
-def _parse_mime(data: bytes) -> EmailMessage:
+def parse_mime(data: bytes) -> EmailMessage:
     message = email.message_from_bytes(data, policy=email_policy.default)
     assert isinstance(message, EmailMessage)
     return message
@@ -98,7 +98,7 @@ def _fetch_live_data(record: EmailRecord, adapter: EasAdapter) -> dict[str, Any]
         return None
     data = item.bodies[0].data
     mime_bytes = data.encode("utf-8") if isinstance(data, str) else data
-    message = _parse_mime(mime_bytes)
+    message = parse_mime(mime_bytes)
     text_body, html_body = _extract_bodies(message)
     return {
         "size": len(mime_bytes),

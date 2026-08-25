@@ -37,8 +37,26 @@ with. Moves and deletes are further gated by `policy.allow_moves`/
 `allow_delete` (forbidden per object when disabled, not method-wide, since
 e.g. keyword updates must stay available either way); `Email/set` create/
 update always commits EAS's returned SyncKey even when the per-item status
-isn't `"1"`, so a rejected mutation never desyncs the folder. `EmailSubmission`
-is M3.
+isn't `"1"`, so a rejected mutation never desyncs the folder.
+
+M3, sending, is implemented: `Identity/get` synthesizes the account's single
+identity from its configured SMTP address (there's no send-as-alias concept
+here, so `Identity/set` doesn't exist), and `EmailSubmission/get`/`set`/
+`changes` submit an existing cached email (typically a draft created via
+`Email/set`) by fetching its full MIME live and passing it unchanged to
+`SendMail`. Sending is immediate -- EAS has no delayed-send/Outbox model --
+so a created submission's `undoStatus` is always `"final"` and update/destroy
+have nothing to change (destroy just forgets the local bookkeeping row; it
+never un-sends). The submission record is persisted *before* the send call,
+recording EAS's `client_id` for correlation, because a transport failure
+after the server already accepted the message is indistinguishable from one
+before it from here -- plan.md section 6 is explicit that this must not
+trigger an automatic resend, and it doesn't. `EmailSubmission/set` create is
+gated by `policy.allow_send` (forbidden per object); unlike the other policy
+gates, disabling it also drops the `urn:ietf:params:jmap:submission`
+capability (and `Identity/get`'s reason for existing) from that account's
+`accountCapabilities` in the session resource, since submission has no other
+purpose a disabled account would still need.
 
 A folder sync caches at most 10 pages (1000 items) per request
 (`SyncCoordinator.DEFAULT_MAX_PAGES_PER_CALL`) so one JMAP request can never

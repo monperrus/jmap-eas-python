@@ -65,6 +65,8 @@ class EasClientProtocol(Protocol):
 
     def move_item(self, item_id: str, src_folder_id: str, dst_folder_id: str) -> str: ...
 
+    def send_mail(self, message: Message, *, save_in_sent_items: bool = True, client_id: str | None = None) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -159,6 +161,14 @@ class EasAdapter:
     def move_item(self, item_id: str, src_folder_id: str, dst_folder_id: str) -> str:
         try:
             return self._client.move_item(item_id, src_folder_id, dst_folder_id)
+        except Exception as exc:
+            raise map_eas_exception(exc) from exc
+
+    def send_mail(self, message: Message, *, save_in_sent_items: bool = True, client_id: str | None = None) -> None:
+        """Not automatically safe to retry (plan.md section 6): a transport failure after the
+        server already accepted the message is indistinguishable from one before, from here."""
+        try:
+            self._client.send_mail(message, save_in_sent_items=save_in_sent_items, client_id=client_id)
         except Exception as exc:
             raise map_eas_exception(exc) from exc
 

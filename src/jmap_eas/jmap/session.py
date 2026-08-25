@@ -9,27 +9,34 @@ from __future__ import annotations
 from typing import Any
 
 from .. import policy
+from ..config import PolicyConfig
 
 
-def build_session(account_id: str, base_url: str) -> dict[str, Any]:
-    mail_capability = policy.CAPABILITIES[policy.MAIL_CAPABILITY]
+def build_session(account_id: str, base_url: str, account_policy: PolicyConfig) -> dict[str, Any]:
+    account_capabilities = {
+        policy.CORE_CAPABILITY: {},
+        policy.MAIL_CAPABILITY: policy.CAPABILITIES[policy.MAIL_CAPABILITY],
+    }
+    if account_policy.allow_send:
+        # Identity/get is introduced alongside EmailSubmission by RFC 8621 section 7 and is
+        # bundled with the same capability; an account with sending disabled has no use for it.
+        account_capabilities[policy.SUBMISSION_CAPABILITY] = policy.CAPABILITIES[policy.SUBMISSION_CAPABILITY]
+
+    primary_accounts = {policy.CORE_CAPABILITY: account_id, policy.MAIL_CAPABILITY: account_id}
+    if account_policy.allow_send:
+        primary_accounts[policy.SUBMISSION_CAPABILITY] = account_id
+
     return {
         "capabilities": policy.CAPABILITIES,
         "accounts": {
             account_id: {
                 "name": account_id,
                 "isPersonal": True,
-                "isReadOnly": True,
-                "accountCapabilities": {
-                    policy.CORE_CAPABILITY: {},
-                    policy.MAIL_CAPABILITY: mail_capability,
-                },
+                "isReadOnly": False,
+                "accountCapabilities": account_capabilities,
             },
         },
-        "primaryAccounts": {
-            policy.CORE_CAPABILITY: account_id,
-            policy.MAIL_CAPABILITY: account_id,
-        },
+        "primaryAccounts": primary_accounts,
         "username": account_id,
         "apiUrl": f"{base_url}/api",
         "downloadUrl": f"{base_url}/download/{{accountId}}/{{blobId}}/{{name}}",

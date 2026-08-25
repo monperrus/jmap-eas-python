@@ -30,6 +30,7 @@ class FakeClient:
         self.delete_folder_calls: list[str] = []
         self.draft_calls: list[tuple] = []
         self.apply_calls: list[tuple] = []
+        self.sent_mail: list[tuple] = []
 
     def provision(self):
         return "policy-key"
@@ -68,6 +69,9 @@ class FakeClient:
 
     def move_item(self, item_id, src_folder_id, dst_folder_id):
         return "10:new"
+
+    def send_mail(self, message, *, save_in_sent_items=True, client_id=None):
+        self.sent_mail.append((message, client_id))
 
     def close(self):
         pass
@@ -390,3 +394,94 @@ def test_email_set_destroy_forbidden_by_policy(tmp_path):
         result = response.json()["methodResponses"][0][1]
         assert result["notDestroyed"][email_id]["type"] == "forbidden"
         assert client_fake.apply_calls == []
+
+
+# -- Identity/get and EmailSubmission/set ----------------------------------------------------
+
+
+def test_identity_get_returns_configured_email(tmp_path):
+    app = _app_with_fake_client(tmp_path, FakeClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Identity/get", {"accountId": "alice"}, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["list"][0]["email"] == "alice@example.com"
+
+
+def test_email_submission_set_sends_referenced_email(tmp_path):
+    client_fake = FakeClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_results={
+            "1": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+                SyncResult(
+                    sync_key="2", added=[SyncItem(server_id="9:1", fields={"Email.Subject": "Hi"})],
+                    changed=[], deleted=[], more_available=False,
+                ),
+            ]
+        },
+        fetched_item=FetchedItem(fields={}, bodies=[ItemBody(type=BodyType.MIME, data=b"Subject: Hi\r\n\r\nBody")],
+                                  attachments=[]),
+    )
+    app = _app_with_fake_client(tmp_path, client_fake)
+    with TestClient(app) as client:
+        query = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+        )
+        email_id = query.json()["methodResponses"][0][1]["ids"][0]
+
+        identity_response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Identity/get", {"accountId": "alice"}, "cid"]]},
+        )
+        identity_id = identity_response.json()["methodResponses"][0][1]["list"][0]["id"]
+
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["EmailSubmission/set", {
+                "accountId": "alice",
+                "create": {"s1": {"identityId": identity_id, "emailId": email_id}},
+            }, "c1"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["notCreated"] == {}
+        assert result["created"]["s1"]["undoStatus"] == "final"
+        assert len(client_fake.sent_mail) == 1
+
+
+def test_email_submission_set_forbidden_by_policy(tmp_path):
+    client_fake = FakeClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_results={
+            "1": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+                SyncResult(
+                    sync_key="2", added=[SyncItem(server_id="9:1", fields={"Email.Subject": "Hi"})],
+                    changed=[], deleted=[], more_available=False,
+                ),
+            ]
+        },
+    )
+    app = _app_with_fake_client(tmp_path, client_fake, policy=PolicyConfig(allow_send=False))
+    with TestClient(app) as client:
+        query = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["Email/query", {"accountId": "alice"}, "c0"]]},
+        )
+        email_id = query.json()["methodResponses"][0][1]["ids"][0]
+
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"methodCalls": [["EmailSubmission/set", {
+                "accountId": "alice", "create": {"s1": {"identityId": "identity", "emailId": email_id}},
+            }, "c0"]]},
+        )
+        result = response.json()["methodResponses"][0][1]
+        assert result["notCreated"]["s1"]["type"] == "forbidden"
+        assert client_fake.sent_mail == []
+
+        session = client.get("/.well-known/jmap", headers=_basic("alice", "bridge-token"))
+        assert "urn:ietf:params:jmap:submission" not in session.json()["accounts"]["alice"]["accountCapabilities"]

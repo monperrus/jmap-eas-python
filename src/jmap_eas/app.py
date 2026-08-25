@@ -88,11 +88,12 @@ async def healthz(request: Request) -> JSONResponse:
 
 async def well_known_jmap(request: Request) -> Response:
     """RFC 8620 section 2: the JMAP session resource."""
+    state: AppState = request.app.state.jmap_eas
     account_id = _authenticate(request)
     if account_id is None:
         return _unauthorized()
     base_url = str(request.base_url).rstrip("/")
-    return JSONResponse(jmap_session.build_session(account_id, base_url))
+    return JSONResponse(jmap_session.build_session(account_id, base_url, state.config.policy))
 
 
 def _parse_method_calls(payload: Any) -> list[Invocation] | None:
@@ -119,9 +120,10 @@ def _sync_and_dispatch(
             state.sync.sync_account(account_id, context.command)
         except JmapError:
             pass  # best-effort freshness; still serve whatever the cache already has
+        account_config = state.config.accounts[account_id]
         env = Environment(
             account_id=account_id, database=state.database, sync=state.sync, adapter=context.command,
-            policy=state.config.policy,
+            policy=state.config.policy, identity_email=account_config.user or account_config.username,
         )
         return state.dispatcher.execute(calls, env)
 

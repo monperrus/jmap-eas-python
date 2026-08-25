@@ -90,6 +90,12 @@ class FakeClient:
             raise StatusError("MoveItems", "1")
         return "10:new"
 
+    def send_mail(self, message, *, save_in_sent_items=True, client_id=None):
+        self.sent_mail = getattr(self, "sent_mail", [])
+        self.sent_mail.append((message, save_in_sent_items, client_id))
+        if self.fail:
+            raise StatusError("SendMail", "6")
+
     def close(self) -> None:
         self.closed = True
 
@@ -244,6 +250,24 @@ def test_move_item_maps_eas_exception():
     adapter = EasAdapter(FakeClient(fail=True))
     with pytest.raises(BackendError):
         adapter.move_item("9:1", "1", "2")
+
+
+def test_send_mail_calls_underlying_client():
+    from email.message import EmailMessage
+
+    client = FakeClient()
+    adapter = EasAdapter(client)
+    message = EmailMessage()
+    adapter.send_mail(message, save_in_sent_items=False, client_id="cid1")
+    assert client.sent_mail == [(message, False, "cid1")]
+
+
+def test_send_mail_maps_eas_exception():
+    from email.message import EmailMessage
+
+    adapter = EasAdapter(FakeClient(fail=True))
+    with pytest.raises(BackendError):
+        adapter.send_mail(EmailMessage())
 
 
 def test_close_closes_underlying_client():

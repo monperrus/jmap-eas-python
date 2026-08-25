@@ -70,6 +70,18 @@ MIGRATIONS: tuple[str, ...] = (
         PRIMARY KEY (account_id, blob_id)
     );
     """,
+    """
+    CREATE TABLE submissions (
+        account_id TEXT NOT NULL,
+        submission_id TEXT NOT NULL,
+        email_id TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, submission_id)
+    );
+    """,
 )
 
 
