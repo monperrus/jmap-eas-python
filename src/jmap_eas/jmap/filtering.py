@@ -39,6 +39,32 @@ def compute_query_changes(
     return sorted(removed), added
 
 
+def extract_inmailbox_scope(filter_: dict[str, Any] | None) -> set[str] | None:
+    """The set of mailbox ids every match of `filter_` is guaranteed to lie in, or `None` if
+    that can't be determined (no filter, a bare condition without `inMailbox`, or any `NOT`).
+
+    Used to scope EAS synchronization to only the mailboxes an `Email/query` can actually
+    return (plan.md's per-request sync scoping): `AND` narrows to the union of any branch's
+    bounded scope (every match must satisfy every branch, so one bounded branch bounds the
+    whole); `OR` is only bounded if *every* branch is; `NOT` is never narrowing.
+    """
+    if filter_ is None or "operator" not in filter_:
+        value = filter_.get("inMailbox") if filter_ is not None else None
+        return {value} if isinstance(value, str) else None
+    operator = filter_.get("operator")
+    conditions = filter_.get("conditions", [])
+    if not isinstance(conditions, list) or not conditions:
+        return None
+    scopes = [extract_inmailbox_scope(c) for c in conditions]
+    if operator == "AND":
+        bounded = [s for s in scopes if s is not None]
+        return set().union(*bounded) if bounded else None
+    if operator == "OR":
+        all_bounded = [s for s in scopes if s is not None]
+        return set().union(*all_bounded) if len(all_bounded) == len(scopes) else None
+    return None
+
+
 def evaluate_filter(filter_: dict[str, Any] | None, record: Any, match_condition: ConditionMatcher) -> bool:
     if filter_ is None:
         return True

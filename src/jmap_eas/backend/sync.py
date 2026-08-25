@@ -5,12 +5,19 @@ to date with EAS before a request needs freshness: reconcile the folder
 hierarchy, then pull each folder's `Sync` delta. A folder's `Sync` calls are
 serialized per `(account_id, folder_id)` because they consume and replace
 that folder's `SyncKey`; unrelated folders and accounts sync independently.
+
+`reconcile_folders()`/`sync_folder()` always hit EAS; `ensure_folders_reconciled()`/
+`ensure_folder_synced()` wrap them with a short freshness window so a foreground
+`POST /api` request doesn't repeat the same round trip a moment-ago request already
+made (`jmap.sync_scope` decides, per request batch, which of these -- if any -- a
+given batch of method calls actually needs).
 """
 from __future__ import annotations
 
 import secrets
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from email.message import Message
 
@@ -27,6 +34,13 @@ DEFAULT_MAX_PAGES_PER_CALL = 10
 must not mean "block until a multi-year mailbox is fully synced"). A folder with more pending
 pages than this simply finishes over subsequent calls -- its SyncKey is persisted after every page."""
 
+DEFAULT_FRESHNESS_SECONDS = 5.0
+"""How long `ensure_folders_reconciled()`/`ensure_folder_synced()` trust a sync they just did
+(plan.md's per-request scoping): a foreground request repeating within this window serves the
+cache as-is instead of repeating the same EAS round trip. Push/Ping-driven syncing (the
+`/eventsource` stream) and every direct mutation are unaffected -- they call `reconcile_folders()`
+/`sync_folder()` directly, which always hit EAS."""
+
 
 class SyncCoordinator:
     def __init__(self, database: Database, *, max_pages_per_call: int = DEFAULT_MAX_PAGES_PER_CALL) -> None:
@@ -34,6 +48,9 @@ class SyncCoordinator:
         self._max_pages_per_call = max_pages_per_call
         self._folder_locks: dict[tuple[str, str], threading.Lock] = {}
         self._folder_locks_guard = threading.Lock()
+        self._reconciled_at: dict[str, float] = {}
+        self._folder_synced_at: dict[tuple[str, str], float] = {}
+        self._freshness_guard = threading.Lock()
 
     def _folder_lock(self, account_id: str, folder_id: str) -> threading.Lock:
         key = (account_id, folder_id)
@@ -95,6 +112,31 @@ class SyncCoordinator:
             self.sync_folder(account_id, folder_id, adapter)
         with self._database.transaction() as conn:
             state.prune_change_log(conn, account_id)
+
+    # -- Request-scoped freshness (plan.md's per-request sync scoping) ---------------
+
+    def ensure_folders_reconciled(
+        self, account_id: str, adapter: EasAdapter, *, max_age: float = DEFAULT_FRESHNESS_SECONDS
+    ) -> None:
+        """`reconcile_folders()`, skipped if this account was already reconciled within `max_age`."""
+        with self._freshness_guard:
+            seen_at = self._reconciled_at.get(account_id)
+            if seen_at is not None and time.monotonic() - seen_at < max_age:
+                return
+            self._reconciled_at[account_id] = time.monotonic()
+        self.reconcile_folders(account_id, adapter)
+
+    def ensure_folder_synced(
+        self, account_id: str, folder_id: str, adapter: EasAdapter, *, max_age: float = DEFAULT_FRESHNESS_SECONDS
+    ) -> None:
+        """`sync_folder()`, skipped if this folder was already synced within `max_age`."""
+        key = (account_id, folder_id)
+        with self._freshness_guard:
+            seen_at = self._folder_synced_at.get(key)
+            if seen_at is not None and time.monotonic() - seen_at < max_age:
+                return
+            self._folder_synced_at[key] = time.monotonic()
+        self.sync_folder(account_id, folder_id, adapter)
 
     def _sync_folder_once(
         self, account_id: str, folder_id: str, adapter: EasAdapter, sync_key: str

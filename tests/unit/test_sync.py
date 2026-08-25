@@ -281,3 +281,47 @@ def test_sync_account_prunes_change_log(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "prune_change_log", lambda conn, account_id: calls.append(account_id))
     coordinator.sync_account("alice", adapter)
     assert calls == ["alice"]
+
+
+def test_ensure_folders_reconciled_skips_within_freshness_window(tmp_path):
+    coordinator, database = _coordinator(tmp_path)
+    folders = [Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")]
+    adapter = EasAdapter(FakeEasClient(folders=folders, sync_responses={}))
+
+    coordinator.ensure_folders_reconciled("alice", adapter, max_age=60)
+    assert {m.mailbox_id for m in cache.list_mailboxes(database.conn, "alice")} == {"1"}
+
+    # A folder deleted upstream after the first call doesn't disappear from the cache yet --
+    # the second call is skipped entirely because it's still within the freshness window.
+    adapter._client._folders = []  # type: ignore[attr-defined]
+    coordinator.ensure_folders_reconciled("alice", adapter, max_age=60)
+    assert {m.mailbox_id for m in cache.list_mailboxes(database.conn, "alice")} == {"1"}
+
+
+def test_ensure_folders_reconciled_runs_again_after_freshness_window(tmp_path):
+    coordinator, database = _coordinator(tmp_path)
+    folders = [Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")]
+    adapter = EasAdapter(FakeEasClient(folders=folders, sync_responses={}))
+
+    coordinator.ensure_folders_reconciled("alice", adapter, max_age=0)
+    adapter._client._folders = []  # type: ignore[attr-defined]
+    coordinator.ensure_folders_reconciled("alice", adapter, max_age=0)
+    assert cache.list_mailboxes(database.conn, "alice") == []
+
+
+def test_ensure_folder_synced_skips_within_freshness_window(tmp_path):
+    coordinator, database = _coordinator(tmp_path)
+    adapter = EasAdapter(FakeEasClient(
+        folders=[Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox")],
+        sync_responses={"1": [
+            SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+            SyncResult(sync_key="2", added=[], changed=[], deleted=[], more_available=False),
+        ]},
+    ))
+    coordinator.reconcile_folders("alice", adapter)
+    coordinator.ensure_folder_synced("alice", "1", adapter, max_age=60)
+    assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "2"
+
+    # No more scripted responses left; a second call within the window must not hit EAS again.
+    coordinator.ensure_folder_synced("alice", "1", adapter, max_age=60)
+    assert cache.get_mailbox(database.conn, "alice", "1").sync_key == "2"

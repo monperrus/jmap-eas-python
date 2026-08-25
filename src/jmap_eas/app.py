@@ -29,10 +29,13 @@ from .jmap import blob as jmap_blob
 from .jmap import eventsource as jmap_eventsource
 from .jmap import session as jmap_session
 from .jmap.dispatcher import Dispatcher, Environment, Invocation
+from .jmap.sync_scope import compute_sync_scope
 from .observability import Metrics, configure_logging, get_logger
 from .registry import AccountContext, AccountRegistry
 from .store import blobs as store_blobs
+from .store import cache as store_cache
 from .store import db as store_db
+from .store import state as store_state
 from .store.db import Database
 
 EVENTSOURCE_IDLE_POLL_SECONDS = 5
@@ -142,20 +145,39 @@ def _check_using(payload: Any) -> str | None:
     return None
 
 
+def _ensure_synced(state: AppState, context: AccountContext, account_id: str, calls: list[Invocation]) -> None:
+    """Brings the cache only as fresh as this batch's calls actually need (plan.md section 1):
+    e.g. `Identity/get` needs no EAS round trip at all, and an `Email/query` scoped by a single
+    `inMailbox` needs only that mailbox's items, not every mailbox in the account. Each piece of
+    work is further skipped if a recent-enough request already did it (`SyncCoordinator`'s
+    request-scoped freshness window)."""
+    scope = compute_sync_scope(calls)
+    try:
+        if scope.reconcile_folders:
+            state.sync.ensure_folders_reconciled(account_id, context.command)
+        folder_ids = set(scope.folder_ids)
+        if scope.sync_all_folders:
+            with state.database.transaction() as conn:
+                folder_ids |= {m.mailbox_id for m in store_cache.list_mailboxes(conn, account_id)}
+        for folder_id in folder_ids:
+            state.sync.ensure_folder_synced(account_id, folder_id, context.command)
+    except JmapError as exc:
+        # Best-effort freshness; still serve whatever the cache already has. `exc` is
+        # already redacted (BackendError never carries raw backend text) so it's safe to log.
+        state.metrics.increment("sync_failures_total")
+        _logger.warning("sync failed, serving from cache", extra={"fields": {
+            "account_id": account_id, "error_type": exc.type,
+        }})
+    with state.database.transaction() as conn:
+        store_state.prune_change_log(conn, account_id)
+
+
 def _sync_and_dispatch(
     state: AppState, context: AccountContext, account_id: str, calls: list[Invocation]
 ) -> list[Invocation]:
     """Runs off the event loop (plan.md section 1): EAS calls are synchronous `requests`."""
     with context.command_lock:
-        try:
-            state.sync.sync_account(account_id, context.command)
-        except JmapError as exc:
-            # Best-effort freshness; still serve whatever the cache already has. `exc` is
-            # already redacted (BackendError never carries raw backend text) so it's safe to log.
-            state.metrics.increment("sync_failures_total")
-            _logger.warning("sync failed, serving from cache", extra={"fields": {
-                "account_id": account_id, "error_type": exc.type,
-            }})
+        _ensure_synced(state, context, account_id, calls)
         account_config = state.config.accounts[account_id]
         env = Environment(
             account_id=account_id, database=state.database, sync=state.sync, adapter=context.command,

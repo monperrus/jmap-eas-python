@@ -191,14 +191,97 @@ def test_healthz_reports_sync_failures_but_request_still_succeeds(tmp_path):
     app = _app_with_fake_client(tmp_path, BrokenSyncClient())
     with TestClient(app) as client:
         before = client.get("/healthz").json()["metrics"]
+        # Mailbox/get needs folder-list freshness (unlike Core/echo, which needs no sync at all).
         response = client.post(
             "/api", headers=_basic("alice", "bridge-token"),
-            json={"using": USING, "methodCalls": [["Core/echo", {}, "c0"]]},
+            json={"using": USING, "methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
         )
         assert response.status_code == 200
-        assert response.json()["methodResponses"] == [["Core/echo", {}, "c0"]]
+        assert response.json()["methodResponses"][0][1]["list"] == []
         after = client.get("/healthz").json()["metrics"]
         assert after["sync_failures_total"] == before["sync_failures_total"] + 1
+
+
+def test_core_echo_does_not_sync(tmp_path):
+    class ExplodingSyncClient(FakeClient):
+        def list_folders(self):
+            raise AssertionError("Core/echo must not trigger a sync")
+
+        def sync_folder(self, *a, **k):
+            raise AssertionError("Core/echo must not trigger a sync")
+
+    app = _app_with_fake_client(tmp_path, ExplodingSyncClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Core/echo", {"foo": "bar"}, "c0"]]},
+        )
+        assert response.status_code == 200
+        assert response.json()["methodResponses"] == [["Core/echo", {"foo": "bar"}, "c0"]]
+
+
+def test_identity_get_does_not_sync(tmp_path):
+    class ExplodingSyncClient(FakeClient):
+        def list_folders(self):
+            raise AssertionError("Identity/get must not trigger a sync")
+
+        def sync_folder(self, *a, **k):
+            raise AssertionError("Identity/get must not trigger a sync")
+
+    app = _app_with_fake_client(tmp_path, ExplodingSyncClient())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Identity/get", {"accountId": "alice"}, "c0"]]},
+        )
+        assert response.status_code == 200
+        assert response.json()["methodResponses"][0][0] == "Identity/get"
+
+
+def test_email_query_scoped_by_inmailbox_only_syncs_that_mailbox(tmp_path):
+    calls: list[str] = []
+
+    class TrackingClient(FakeClient):
+        def list_folders(self):
+            calls.append("list_folders")
+            return self._folders
+
+        def sync_folder(self, folder_id, sync_key="0", *, window_size=100, filter_type=None):
+            calls.append(f"sync:{folder_id}")
+            return self._sync_results[folder_id].pop(0)
+
+    client_fake = TrackingClient(
+        folders=[
+            Folder(id="1", parent_id="0", type=FolderType.INBOX, name="Inbox"),
+            Folder(id="2", parent_id="0", type=FolderType.SENT_ITEMS, name="Sent"),
+        ],
+        sync_results={
+            "1": [
+                SyncResult(sync_key="1", added=[], changed=[], deleted=[], more_available=False),
+                SyncResult(sync_key="2", added=[], changed=[], deleted=[], more_available=False),
+            ],
+        },
+    )
+    app = _app_with_fake_client(tmp_path, client_fake)
+    with TestClient(app) as client:
+        # Cache the folder list first so the query call itself needs no reconciliation.
+        client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [["Mailbox/get", {"accountId": "alice"}, "c0"]]},
+        )
+        calls.clear()
+
+        response = client.post(
+            "/api", headers=_basic("alice", "bridge-token"),
+            json={"using": USING, "methodCalls": [
+                ["Email/query", {"accountId": "alice", "filter": {"inMailbox": "1"}}, "c0"],
+            ]},
+        )
+        assert response.status_code == 200
+        # Only mailbox "1" is synced (a never-before-synced folder bootstraps its SyncKey in a
+        # first round trip, then fetches its first page in a second); mailbox "2" and folder
+        # reconciliation are both untouched.
+        assert calls == ["sync:1", "sync:1"]
 
 
 def test_api_missing_using_is_rejected(tmp_path):
